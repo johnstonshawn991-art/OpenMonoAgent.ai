@@ -1,3 +1,4 @@
+
 # not needed anymore - we are using the pre-baked image from llamacpp official repo
 ARG BUILD_IMAGE=ubuntu:24.04
 ARG RUNTIME_IMAGE=ubuntu:24.04
@@ -26,7 +27,9 @@ COPY llama.cpp/ .
 # Use build args to decide between CUDA and BLAS
 ARG GGML_CUDA=OFF
 ARG CUDA_DOCKER_ARCH=all
-RUN if [ "$GGML_CUDA" = "ON" ]; then \
+
+\
+ ]; then \
         cmake -B build -DGGML_CUDA=ON -DCUDA_DOCKER_ARCH=${CUDA_DOCKER_ARCH} \
             -DGGML_NATIVE=OFF \
             -DCMAKE_EXE_LINKER_FLAGS=-Wl,--allow-shlib-undefined \
@@ -36,7 +39,8 @@ RUN if [ "$GGML_CUDA" = "ON" ]; then \
     fi && \
     cmake --build build --config Release -j$(nproc) --target llama-server
 
-FROM ${RUNTIME_IMAGE}
+FROM ${RUNTIME
+_IMAGE}
 
 ENV DEBIAN_FRONTEND=noninteractive
 # Include CUDA compat libs injected by nvidia-container-toolkit
