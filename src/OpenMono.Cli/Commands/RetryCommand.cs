@@ -47,6 +47,6 @@ public sealed class RetryCommand : ICommand
             : lastUserText.Replace('\n', ' ');
         context.Renderer.WriteInfo($"Retrying: {preview}");
 
-        await _loop.RunTurnAsync(lastUserText, ct);
+        await _loop.RunTurnAsync(lastUserText, null, ct);
     }
 }

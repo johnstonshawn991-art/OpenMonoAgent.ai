@@ -39,22 +39,6 @@ internal sealed class AnsiInputReader(
             if (s == "[200~")
                 return (0, ReadBracketedPasteContent(), 0, 0);
 
-            if (ch is 'M' or 'm')
-            {
-                if (s.StartsWith("[<") && s.Length >= 4)
-                {
-                    var termIdx = s.Length - 1;
-                    var inner = s[2..termIdx];
-                    var parts = inner.Split(';');
-                    if (parts.Length == 3 && int.TryParse(parts[0], out var btn))
-                    {
-                        if (btn == 64) return (+1, null, 0, 0);
-                        if (btn == 65) return (-1, null, 0, 0);
-                    }
-                }
-                break;
-            }
-
             if ((ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') || ch == '~')
             {
                 if (s == "O" && Console.KeyAvailable)
@@ -66,6 +50,8 @@ internal sealed class AnsiInputReader(
                     "f" or "[1;3C" or "[1;5C" => (0, null, +1,  0),
                     "[1;9D" or "[H" or "OH"   => (0, null,  0, -1),
                     "[1;9C" or "[F" or "OF"   => (0, null,  0, +1),
+                    "[5~"  or "[1;2A"         => (+1, null,  0,  0),
+                    "[6~"  or "[1;2B"         => (-1, null,  0,  0),
                     _                          => (0, null,  0,  0),
                 };
             }
@@ -175,6 +161,9 @@ internal sealed class AnsiInputReader(
                 CurrentTurnCts?.Cancel();
                 continue;
             }
+
+            if (k.Key == ConsoleKey.PageUp)   { painter.ScrollBy(+3); painter.Paint(); continue; }
+            if (k.Key == ConsoleKey.PageDown) { painter.ScrollBy(-3); painter.Paint(); continue; }
 
             if (k.Key == ConsoleKey.C && k.Modifiers.HasFlag(ConsoleModifiers.Control))
             {
@@ -381,6 +370,9 @@ internal sealed class AnsiInputReader(
                     ctrlCBannerShown = false;
                     painter.PaintConvThrottled(force: true);
                 }
+
+                if (k.Key == ConsoleKey.PageUp)   { painter.ScrollBy(+3); painter.Paint(); continue; }
+                if (k.Key == ConsoleKey.PageDown) { painter.ScrollBy(-3); painter.Paint(); continue; }
 
                 if (k.Key == ConsoleKey.C && k.Modifiers.HasFlag(ConsoleModifiers.Control))
                 {

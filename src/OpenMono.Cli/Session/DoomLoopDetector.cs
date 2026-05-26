@@ -6,8 +6,8 @@ namespace OpenMono.Session;
 internal sealed class DoomLoopDetector
 {
     private readonly List<string> _signatures = [];
-    private const int MaxPeriod  = 4;   // detects up to ABCDABCD
-    private const int MaxHistory = 12;  // MaxPeriod * 3
+    private const int MaxPeriod  = 4;
+    private const int MaxHistory = 12;
 
     public void Reset() => _signatures.Clear();
 

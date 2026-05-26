@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.Text;
 using System.Text.Json;
+using OpenMono.Acp;
 using OpenMono.Config;
 using OpenMono.History;
 using OpenMono.Hooks;
@@ -31,6 +32,9 @@ public sealed class ConversationLoop : IDisposable
     private readonly CursorStore _cursorStore;
     private readonly ToolResultCache _cache;
     private readonly ArtifactStore _artifactStore;
+    private readonly IAcpEventSink? _sink;
+    private readonly IToolExecutor _executor;
+    private readonly IReadOnlyList<ITool>? _toolSubset;
 
     private readonly DoomLoopDetector _doomLoop = new();
 
@@ -51,13 +55,32 @@ public sealed class ConversationLoop : IDisposable
         TurnJournal? journal = null,
         ToolResultCache? cache = null,
         ArtifactStore? artifactStore = null,
-        Checkpointer? checkpointer = null)
+        Checkpointer? checkpointer = null,
+        IAcpEventSink? sink = null,
+        IToolExecutor? executor = null,
+        IReadOnlyList<ITool>? toolSubset = null,
+        IAcpUserInteraction? interaction = null)
     {
         _llm = llm;
         _tools = tools;
-        _permissions = permissions;
         _output = output;
-        _input = input;
+        if (interaction is null)
+        {
+            _input = input;
+            _permissions = permissions;
+        }
+        else
+        {
+
+
+
+
+
+
+            var adapter = new AcpInputReaderAdapter(interaction);
+            _input = adapter;
+            _permissions = new PermissionEngine(config, output, adapter);
+        }
         _liveFeedback = liveFeedback;
         _config = config;
         _session = session;
@@ -69,6 +92,23 @@ public sealed class ConversationLoop : IDisposable
         _cursorStore = new CursorStore();
         _cache = cache ?? new ToolResultCache();
         _artifactStore = artifactStore ?? ArtifactStore.ForSession(session, config.DataDirectory);
+        _sink = sink;
+
+
+
+
+
+        _executor = executor ?? new LocalToolExecutor(
+            _journal,
+            _output,
+            _config,
+            _session,
+            _permissions,
+            _cache,
+            _artifactStore,
+            _hookRunner,
+            _sink);
+        _toolSubset = toolSubset;
     }
 
     public void Dispose()
@@ -78,11 +118,37 @@ public sealed class ConversationLoop : IDisposable
         _artifactStore.Dispose();
     }
 
-    public async Task RunTurnAsync(string userInput, CancellationToken ct)
+    public async Task RunTurnAsync(string userInput, IReadOnlyList<ContentPart>? imageParts, CancellationToken ct)
     {
         _doomLoop.Reset();
-        _session.AddMessage(new Message { Role = MessageRole.User, Content = userInput });
+        _session.AddMessage(new Message {
+            Role = MessageRole.User,
+            Content = imageParts is { Count: > 0 }
+                ? $"[{imageParts.Count} image(s)] {userInput}"
+                : userInput,
+            ContentParts = imageParts is { Count: > 0 }
+                ? [new TextPart(userInput), .. imageParts]
+                : null
+        });
+        if (imageParts is { Count: > 0 } && !_config.VisionEnabled)
+        {
+            _output.WriteWarning("Image attached but vision is not enabled — re-run 'openmono setup'.");
+            return;
+        }
         _session.TurnCount++;
+        await RunTurnInternalAsync(ct);
+    }
+
+
+
+
+
+
+    public Task ContinueTurnAsync(CancellationToken ct) => RunTurnInternalAsync(ct);
+
+    private async Task RunTurnInternalAsync(CancellationToken ct)
+    {
+        _doomLoop.Reset();
         _liveFeedback?.BeginTurn();
 
         try
@@ -115,9 +181,10 @@ public sealed class ConversationLoop : IDisposable
             await RunCompactionAsync(lastPromptTokens, customInstructions: null, ct);
         }
 
+        var allowedToolNames = (_toolSubset?.Select(t => t.Name) ?? _tools.All.Select(t => t.Name)).ToArray();
         var toolDefs = _session.Meta.PlanMode
-            ? _tools.BuildToolDefinitionsFor(_tools.All.Where(t => t.IsReadOnly).Select(t => t.Name))
-            : _tools.BuildToolDefinitions();
+            ? _tools.BuildToolDefinitionsFor(allowedToolNames.Where(n => _tools.Resolve(n)?.IsReadOnly == true))
+            : _tools.BuildToolDefinitionsFor(allowedToolNames);
         var thinking = _session.Meta.ThinkingEnabled;
         var options = new LlmOptions
         {
@@ -202,6 +269,7 @@ public sealed class ConversationLoop : IDisposable
                     _output.AppendThinking(chunk.ThinkingDelta);
                     thinkingStarted = true;
                     thinkingChars += chunk.ThinkingDelta.Length;
+                    if (_sink is not null) await _sink.OnThinkingDeltaAsync(chunk.ThinkingDelta);
                     continue;
                 }
 
@@ -221,8 +289,7 @@ public sealed class ConversationLoop : IDisposable
                 {
                     textBuffer.Append(chunk.TextDelta);
                     _output.StreamText(chunk.TextDelta);
-
-
+                    if (_sink is not null) await _sink.OnTextDeltaAsync(chunk.TextDelta);
                 }
 
                 if (chunk.ToolCallDelta is not null)
@@ -234,8 +301,10 @@ public sealed class ConversationLoop : IDisposable
                     if (tool is not null && tool.IsConcurrencySafe && tool.IsReadOnly)
                     {
                         _output.WriteDebug($"[P2.4] Starting {call.Name} while streaming...");
+
+
                         inFlightTasks[call.Id] = Task.Run(
-                            () => ExecuteSingleToolAsync(call, tool, context, siblingAbortCts.Token),
+                            () => _executor.ExecuteAsync(call, tool, context, siblingAbortCts.Token),
                             siblingAbortCts.Token);
                     }
                 }
@@ -282,6 +351,7 @@ public sealed class ConversationLoop : IDisposable
             if (toolCalls.Count == 0)
             {
                 _journal.FinishTurn("text_only");
+                await EmitUsageAsync();
                 return;
             }
 
@@ -296,6 +366,7 @@ public sealed class ConversationLoop : IDisposable
                     Content = "[System: Doom loop detected — you called the same tools 3 times in a row with identical arguments. Stop repeating and try a different approach, or ask the user for help.]",
                 });
                 _journal.FinishTurn("doom_loop");
+                await EmitUsageAsync();
                 return;
             }
 
@@ -319,7 +390,26 @@ public sealed class ConversationLoop : IDisposable
                     ToolName = call.Name,
                     Content = content,
                 });
+
+                if (_sink is not null)
+                {
+                    var artifactId = result.Artifacts.Count > 0 ? result.Artifacts[0].Id : null;
+                    await _sink.OnToolResultPreviewAsync(call.Id, result.ModelPreview, artifactId);
+                }
             }
+
+            var pendingImages = results
+                .Where(r => r.Images is { Count: > 0 })
+                .SelectMany(r => r.Images!)
+                .ToList();
+            if (pendingImages.Count > 0)
+                _session.AddMessage(new Message
+                {
+                    Role = MessageRole.User,
+                    Content = $"[{pendingImages.Count} image(s) from tool calls]",
+                    ContentParts = [new TextPart("Images retrieved by tools:"), .. pendingImages],
+                });
+
             if (results.Any(r => r.BreakTurn))
             {
                 if (_session.Meta.LastPlan is { Length: > 0 } plan)
@@ -333,12 +423,14 @@ public sealed class ConversationLoop : IDisposable
                     Content = PlanModeInstructions.PlanPresented,
                 });
                 _journal.FinishTurn("turn_break");
+                await EmitUsageAsync();
                 return;
             }
         }
 
         await ReportIterationCapAsync(maxIterations, new List<ToolCall>(), ct);
         _journal.FinishTurn("max_iterations");
+        await EmitUsageAsync();
         }
         finally
         {
@@ -483,6 +575,17 @@ public sealed class ConversationLoop : IDisposable
 
         report.RenderTo(_output.WriteInfo, promptTokens);
         _output.WriteDebug($"[Compact] Done — {_session.Messages.Count} messages remaining");
+
+        if (_sink is not null)
+            await _sink.OnCompactionAsync(report.MessagesCompressed, report.Duration.TotalSeconds, _session.Checkpoints.Count);
+    }
+
+    private Task EmitUsageAsync()
+    {
+        if (_sink is null) return Task.CompletedTask;
+        var tracker = _session.Meta.TokenTracker;
+        if (tracker is null) return Task.CompletedTask;
+        return _sink.OnUsageAsync(tracker.TotalPromptTokens, tracker.TotalCompletionTokens, tracker.TotalTokens);
     }
 
 
@@ -516,7 +619,7 @@ public sealed class ConversationLoop : IDisposable
         {
             await Task.WhenAll(readOnly.Select(async item =>
             {
-                var result = await ExecuteSingleToolAsync(item.Call, item.Tool, context, ct);
+                var result = await _executor.ExecuteAsync(item.Call, item.Tool, context, ct);
                 results[item.Index] = result;
             }));
         }
@@ -529,7 +632,7 @@ public sealed class ConversationLoop : IDisposable
                 continue;
             }
 
-            results[item.Index] = await ExecuteSingleToolAsync(item.Call, item.Tool, context, ct);
+            results[item.Index] = await _executor.ExecuteAsync(item.Call, item.Tool, context, ct);
         }
 
         return [.. results];
@@ -542,6 +645,11 @@ public sealed class ConversationLoop : IDisposable
         CancellationTokenSource siblingAbortCts,
         CancellationToken ct)
     {
+
+
+
+
+
         var results = new ToolResult[toolCalls.Count];
         var readOnlyPending = new List<(int Index, ToolCall Call, ITool Tool)>();
         var writeable = new List<(int Index, ToolCall Call, ITool Tool)>();
@@ -574,7 +682,7 @@ public sealed class ConversationLoop : IDisposable
         foreach (var item in readOnlyPending)
         {
             inFlightTasks[item.Call.Id] = Task.Run(
-                () => ExecuteSingleToolAsync(item.Call, item.Tool, context, siblingAbortCts.Token),
+                () => _executor.ExecuteAsync(item.Call, item.Tool, context, siblingAbortCts.Token),
                 siblingAbortCts.Token);
         }
 
@@ -618,170 +726,11 @@ public sealed class ConversationLoop : IDisposable
                 continue;
             }
 
-            results[item.Index] = await ExecuteSingleToolAsync(item.Call, item.Tool, context, ct);
+            results[item.Index] = await _executor.ExecuteAsync(item.Call, item.Tool, context, ct);
         }
 
         return [.. results];
     }
-
-    private async Task<ToolResult> ExecuteSingleToolAsync(
-        ToolCall call, ITool tool, ToolContext context, CancellationToken ct)
-    {
-
-        _journal.RecordToolCallReceived(call.Id, call.Name, call.Arguments);
-
-        JsonElement input;
-        try
-        {
-            input = JsonDocument.Parse(call.Arguments).RootElement;
-        }
-        catch (JsonException ex)
-        {
-            _journal.RecordSchemaRejected(call.Id, $"json_parse: {ex.Message}");
-            return ToolResult.Error(
-                $"Invalid JSON arguments for {call.Name}: {ex.Message}\nRaw: {call.Arguments[..Math.Min(200, call.Arguments.Length)]}");
-        }
-
-        var validationError = ValidateToolInput(tool, input);
-        if (validationError is not null)
-        {
-            _journal.RecordSchemaRejected(call.Id, validationError);
-            _output.WriteToolDenied(call.Name, validationError);
-            Log.Warn($"Tool schema rejected: {call.Name} — {validationError}");
-            return ToolResult.Error(validationError);
-        }
-        _journal.RecordSchemaValidated(call.Id);
-
-        var sanityError = SanityCheck.Check(call.Name, input, _config.WorkingDirectory);
-        if (sanityError is not null)
-        {
-            _journal.RecordSanityRejected(call.Id, sanityError);
-            _output.WriteToolDenied(call.Name, sanityError);
-            Log.Warn($"Tool sanity-rejected: {call.Name} — {sanityError}");
-            return ToolResult.Error(sanityError);
-        }
-        _journal.RecordSanityChecked(call.Id);
-
-        if (_session.Meta.PlanMode && !tool.IsReadOnly)
-        {
-            var planModeError = $"Plan mode is active — only read-only tools are allowed. " +
-                                $"Call ExitPlanMode first to make changes with {call.Name}.";
-            _journal.RecordPermissionDecided(call.Id, false, "plan_mode_active");
-            _output.WriteToolDenied(call.Name, planModeError);
-            Log.Info($"Tool blocked by plan mode: {call.Name}");
-            return ToolResult.Error(planModeError);
-        }
-
-        var capabilities = tool.RequiredCapabilities(input);
-        bool allowed;
-        string? reason;
-
-        if (capabilities.Count > 0)
-        {
-
-            var capDecision = await _permissions.CheckCapabilitiesAsync(tool.Name, capabilities, ct);
-            allowed = capDecision.Allowed;
-            reason = capDecision.Reason;
-        }
-        else
-        {
-
-            var permLevel = tool.RequiredPermission(input);
-            var legacyDecision = await _permissions.CheckAsync(tool.Name, input, permLevel, ct);
-            allowed = legacyDecision.Allowed;
-            reason = legacyDecision.Reason;
-        }
-
-        if (!allowed)
-        {
-            _journal.RecordPermissionDecided(call.Id, false, reason);
-            _output.WriteToolDenied(call.Name, reason ?? "Permission denied");
-            Log.Info($"Tool denied: {call.Name} — {reason ?? "User denied"}");
-            return ToolResult.Error($"Permission denied for {call.Name}: {reason ?? PermissionEngine.PermissionDeniedOnce}");
-        }
-        _journal.RecordPermissionDecided(call.Id, true);
-
-        if (tool.IsReadOnly && _cache.TryGet(call.Name, input, out var cachedResult) && cachedResult is not null)
-        {
-            _journal.RecordToolStarted(call.Id);
-            _journal.RecordToolCompleted(call.Id, cachedResult.Class, cachedResult.Artifacts.Select(a => a.Id).ToList());
-            _output.WriteToolStart(call.Name, call.Arguments);
-            _output.WriteToolSuccess(call.Name);
-            Log.Debug($"Tool cache hit: {call.Name}");
-            return cachedResult with { ModelPreview = $"[cached] {cachedResult.ModelPreview}" };
-        }
-
-        _output.WriteToolStart(call.Name, call.Arguments);
-
-        _session.Meta.TokenTracker?.RecordToolUse(call.Name);
-
-        _journal.RecordToolStarted(call.Id);
-
-        try
-        {
-
-            await _hookRunner.RunPreToolUseHooksAsync(call.Name, call.Arguments, ct);
-
-            Log.Debug($"Tool executing: {call.Name}");
-            var result = await tool.ExecuteAsync(input, context, ct);
-
-            await _hookRunner.RunPostToolUseHooksAsync(call.Name, result.Content, ct);
-
-            if (result.Class == ResultClass.Success && result.ModelPreview.Length > _artifactStore.LargeOutputThreshold)
-            {
-                result = _artifactStore.PersistAndReplace(result, call.Name);
-                Log.Debug($"Tool output persisted as artifact: {call.Name} ({result.Artifacts.Count} artifacts)");
-            }
-
-            if (tool.IsReadOnly && result.Class == ResultClass.Success)
-            {
-                _cache.Put(call.Name, input, result);
-            }
-
-            if (!tool.IsReadOnly && call.Name is "FileWrite" or "FileEdit" or "ApplyPatch")
-            {
-                if (input.TryGetProperty("file_path", out var pathEl) && pathEl.GetString() is { } filePath)
-                {
-                    var resolvedPath = Path.GetFullPath(filePath, _config.WorkingDirectory);
-                    _cache.InvalidatePath(resolvedPath);
-                    FileReadTool.InvalidateCache(resolvedPath);
-                }
-            }
-
-            var artifactIds = result.Artifacts.Select(a => a.Id).ToList();
-            _journal.RecordToolCompleted(call.Id, result.Class, artifactIds);
-
-            if (result.IsError)
-            {
-                _output.WriteToolError(call.Name, result.ErrorMessage ?? "Unknown error");
-                Log.Warn($"Tool error: {call.Name} — {result.ErrorMessage}");
-            }
-            else
-            {
-                _output.WriteToolSuccess(call.Name);
-                if (result.Diff is not null)
-                    _output.WriteToolDiff(result.Diff);
-            }
-
-            return result;
-        }
-        catch (OperationCanceledException)
-        {
-            _journal.RecordToolCrashed(call.Id, "OperationCanceledException", "cancelled");
-            Log.Info($"Tool cancelled: {call.Name}");
-            return ToolResult.Cancelled($"{call.Name} was cancelled");
-        }
-        catch (Exception ex)
-        {
-            _journal.RecordToolCrashed(call.Id, ex.GetType().Name, ex.Message);
-            _output.WriteToolError(call.Name, ex.Message);
-            Log.Error($"Tool exception: {call.Name}", ex);
-            return ToolResult.Crash($"Tool execution failed: {ex.Message}", "Try with different parameters or report this as a bug.");
-        }
-    }
-
-    private static string? ValidateToolInput(ITool tool, JsonElement input)
-        => SchemaValidator.Validate(tool.Name, tool.InputSchema, input);
 
     private ToolContext BuildToolContext() => new()
     {
@@ -797,5 +746,6 @@ public sealed class ConversationLoop : IDisposable
         BeginResponse = _output.StartAssistantResponse,
         EndResponse = () => _output.EndAssistantResponse(),
         StreamText = _output.StreamText,
+        OnDebug = msg => { _output.WriteDebug(msg); Log.Debug(msg); },
     };
 }

@@ -1,3 +1,5 @@
+using OpenMono.Session;
+
 namespace OpenMono.Tools;
 
 public sealed record ToolResult
@@ -71,6 +73,9 @@ public sealed record ToolResult
     public ToolResult WithDiff(string? diff) =>
         diff is null ? this : this with { Diff = diff };
         
+    public IReadOnlyList<ImagePart>? Images { get; init; }
+    public ToolResult WithImages(IReadOnlyList<ImagePart> images) => this with { Images = images };
+
     public bool BreakTurn { get; init; }
     public ToolResult WithBreakTurn() => this with { BreakTurn = true };
 }

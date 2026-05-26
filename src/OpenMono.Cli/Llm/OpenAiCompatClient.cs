@@ -327,6 +327,12 @@ public sealed class OpenAiCompatClient : ILlmClient, IDisposable
         var apiMessages = messages.Select<Message, object>(m => m.Role switch
         {
             MessageRole.System => new { role = "system", content = m.Content },
+            MessageRole.User when m.ContentParts is { Count: > 0 } =>
+                new { role = "user", content = (object)m.ContentParts.Select<ContentPart, object>(p => p switch {
+                    TextPart t  => (object)new { type = "text", text = t.Text },
+                    ImagePart i => new { type = "image_url", image_url = new { url = i.Url } },
+                    _           => new { type = "text", text = "" }
+                }).ToList() },
             MessageRole.User => new { role = "user", content = m.Content },
             MessageRole.Assistant when m.ToolCalls is { Count: > 0 } =>
                 new

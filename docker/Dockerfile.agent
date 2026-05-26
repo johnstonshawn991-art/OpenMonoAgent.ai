@@ -1,23 +1,37 @@
+# syntax=docker/dockerfile:1.6
+#
+# OpenMono agent image — three modes selected by env vars at runtime:
+#   1. VS Code extension (DockerManager) and `public/scripts/acp-smoke.sh`:
+#      OPENMONO_ACP_ONLY=1 → headless ACP server on 7475.
+#   2. `public/docker/docker-compose.yml` agent service:
+#      OPENMONO_ACP_ENABLED=1 → interactive TUI + ACP server in the background.
+#   3. Plain `docker run -it openmono/agent` → interactive TUI only.
+#
+# Build from the `public/` directory:
+#   docker build -f public/docker/Dockerfile.agent -t openmono/agent:dev public/
+
 FROM mcr.microsoft.com/dotnet/sdk:10.0 AS build
 WORKDIR /src
 
-# Copy solution-level files needed for restore
+# Solution-level files for restore layer caching.
 COPY Directory.Build.props ./
 COPY OpenMono.sln ./
 COPY global.json ./
 
-# Copy project file first for layer caching
 COPY src/OpenMono.Cli/OpenMono.Cli.csproj src/OpenMono.Cli/
-
-# Restore dependencies (cached unless csproj changes)
 RUN dotnet restore src/OpenMono.Cli/OpenMono.Cli.csproj
 
-# Copy source and publish
 COPY src/OpenMono.Cli/ src/OpenMono.Cli/
 RUN dotnet publish src/OpenMono.Cli/OpenMono.Cli.csproj \
     -c Release \
     -o /app \
-    --no-restore
+    --no-restore \
+    /p:UseAppHost=true
+
+# ── Runtime ────────────────────────────────────────────────────────────────
+# We need the SDK base because the agent's tools (Bash, Grep, ApplyPatch) shell
+# out to git / ripgrep / patch / python and the slim aspnet image doesn't ship
+# those.
 
 FROM mcr.microsoft.com/dotnet/sdk:10.0 AS runtime
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -30,16 +44,32 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3-pip \
     && rm -rf /var/lib/apt/lists/*
 
+# HOME for the docker-compose TUI variant; compose mounts ~/.openmono here.
 RUN mkdir -p /home/agent && chmod 1777 /home/agent
 
-# Install code-review-graph for structural code analysis (MCP server)
-RUN pip3 install --no-cache-dir --break-system-packages code-review-graph
-
-# Install graphify for semantic knowledge graph queries (MCP server)
-RUN pip3 install --no-cache-dir --break-system-packages graphifyy
+# MCP servers shipped with the agent (structural + semantic graph queries).
+RUN pip3 install --no-cache-dir --break-system-packages code-review-graph graphifyy
 
 COPY --from=build /app /usr/local/bin/openmono/
 ENV PATH="/usr/local/bin/openmono:${PATH}"
 
+# Sessions live in /data. ACP callers MUST mount a named volume here
+# (e.g. `-v openmono-sessions-<agent_id>:/data`) for session JSON files to
+# survive container removal. With `--rm` and an anonymous volume, session
+# state is wiped on every container stop.
+VOLUME ["/data"]
+
+# Default workspace mount-point. ACP callers pass -v <host>:/workspace;
+# the docker-compose service mounts ${WORKSPACE:-.} here.
 WORKDIR /workspace
+
+# ACP server port (used when --acp-only is active).
+EXPOSE 7475
+ENV ACP_PORT=7475 \
+    ASPNETCORE_URLS=http://0.0.0.0:7475
+
+# Consumers pick their mode via env vars instead of overriding CMD:
+#   - VS Code extension / acp-smoke.sh: set OPENMONO_ACP_ONLY=1 → headless ACP.
+#   - docker-compose agent service:     set OPENMONO_ACP_ENABLED=1 → TUI + ACP.
+# The image's default (no env, no flag) is the interactive TUI.
 ENTRYPOINT ["openmono"]

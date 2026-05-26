@@ -1,0 +1,71 @@
+using OpenMono.Commands;
+using OpenMono.Permissions;
+using OpenMono.Rendering;
+
+namespace OpenMono.Acp;
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+public sealed class AcpInputReaderAdapter : IInputReader
+{
+    private readonly IAcpUserInteraction _interaction;
+
+    public AcpInputReaderAdapter(IAcpUserInteraction interaction)
+    {
+        _interaction = interaction;
+    }
+
+    public async Task<PermissionResponse> AskPermissionAsync(string toolName, string summary, CancellationToken ct)
+    {
+        var dangerous = LooksDestructive(toolName, summary);
+        var allow = await _interaction.RequestPermissionAsync(toolName, summary, dangerous, ct);
+        return allow ? PermissionResponse.Allow : PermissionResponse.Deny;
+    }
+
+    public async Task<string> AskUserAsync(string question, CancellationToken ct)
+    {
+        var value = await _interaction.RequestUserInputAsync(question, ct);
+        return value ?? string.Empty;
+    }
+
+
+
+    public void EnableCommandSuggestions(CommandRegistry registry) { }
+    public string ReadInput() => string.Empty;
+    public string? ShowCommandPicker(CommandRegistry registry) => null;
+
+
+
+
+
+
+
+    private static bool LooksDestructive(string toolName, string summary)
+    {
+        if (string.Equals(toolName, "Bash", StringComparison.Ordinal))
+        {
+            var lower = summary.ToLowerInvariant();
+            if (lower.Contains("rm -rf") || lower.Contains("rm -fr")) return true;
+            if (lower.Contains("git reset --hard")) return true;
+            if (lower.Contains("git push --force") || lower.Contains("git push -f")) return true;
+            if (lower.Contains("docker volume rm") || lower.Contains("docker system prune")) return true;
+            if (lower.Contains("mkfs") || lower.Contains("dd if=")) return true;
+        }
+        if (string.Equals(toolName, "FileWrite", StringComparison.Ordinal)) return true;
+        if (string.Equals(toolName, "ApplyPatch", StringComparison.Ordinal)) return true;
+        return false;
+    }
+}

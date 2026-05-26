@@ -4,13 +4,17 @@ set -euo pipefail
 # ──────────────────────────────────────────────────────────────────────────────
 # OpenMono.ai — Prerequisite Installer for macOS
 #
-# Installs: Homebrew, Xcode CLT, git, cmake, curl, jq, .NET 10, ripgrep, Docker
-#           Desktop (and notes on Apple Silicon support).
+# Installs prerequisites based on OPENMONO_ROLE (set by the openmono CLI):
+#   full      — Homebrew, Xcode CLT, core tools, llama.cpp (arm64), Docker, .NET
+#   inference — Homebrew, Xcode CLT, core tools, llama.cpp (arm64) only — no Docker
+#   agent     — Homebrew, Xcode CLT, core tools, Docker, .NET — no llama.cpp
 #
 # Options:
-#   OPENMONO_VERBOSE=1    Show detailed command output
+#   OPENMONO_ROLE=full|inference|agent  (exported by openmono CLI; defaults to full)
+#   OPENMONO_VERBOSE=1                  Show detailed command output
 #
-# Tested on: macOS 14+ (Sonoma, Sequoia) with Apple Silicon (M1+) and Intel
+# Tested on: macOS 14+ (Sonoma, Sequoia) with Apple Silicon (M1+)
+# Intel Macs: supported for agent role only (no llama.cpp / inference)
 # ──────────────────────────────────────────────────────────────────────────────
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -25,6 +29,9 @@ fi
 # Add openmono to PATH for current session
 export PATH="$REPO_DIR:$PATH"
 # (RC file updates are handled by openmono cmd_setup after installation completes)
+
+# Role determines which components are installed. Default to full if not set.
+OPENMONO_ROLE="${OPENMONO_ROLE:-full}"
 
 TOTAL_STEPS=8
 
@@ -199,22 +206,39 @@ else
     die "pip3 not found after python3 install"
 fi
 
-# ── Step 5: Apple Silicon / Metal notes ────────────────────────────────────────
+# ── Step 5: llama.cpp (Apple Silicon only) ────────────────────────────────────
 
-step 5 $TOTAL_STEPS "Apple Silicon configuration"
+step 5 $TOTAL_STEPS "Setting up native inference (Apple Silicon)"
 
 if [ "$ARCH" = "arm64" ]; then
-    ok "Apple Silicon (M-series) detected"
-    info "Docker on macOS runs a Linux VM — no direct Metal GPU passthrough to containers."
-    info "The inference server will run in CPU mode for now."
-    detail "Note: Future enhancement could use Docker Model Runner with vllm-metal backend."
+    # llama.cpp from Homebrew runs natively on the host with Metal GPU acceleration.
+    # This is required for the full and inference roles on macOS.
+    if command -v llama-server &>/dev/null; then
+        ok "llama.cpp already installed ($(llama-server --version 2>/dev/null | head -1))"
+    else
+        info "Installing llama.cpp (Metal backend)..."
+        if ! run brew install llama.cpp; then
+            die "Failed to install llama.cpp"
+        fi
+        ok "llama.cpp installed"
+    fi
+    detail "llama-server: $(command -v llama-server)"
 else
-    ok "Intel Mac — Docker CPU mode (standard)"
+    # Intel Macs have no Metal GPU and no unified memory.
+    # Native inference via llama.cpp is not supported — skipping install.
+    warn "Intel Mac detected — llama.cpp (Metal) will NOT be installed."
+    warn "The 'full' and 'inference' roles are only supported on Apple Silicon."
+    warn "You can still use the 'agent' role and connect to a remote inference server."
 fi
 
-# ── Step 6: Docker — Desktop or Colima ──────────────────────────────────────
+# ── Step 6: Docker — Desktop or Colima (skipped for inference role) ──────────
 
 step 6 $TOTAL_STEPS "Setting up Docker"
+
+if [ "$OPENMONO_ROLE" = "inference" ]; then
+    ok "Docker not required for inference role — skipping"
+    DOCKER_DAEMON_TYPE="none"
+else
 
 BREW_PREFIX=$(brew --prefix)
 DOCKER_PLUGINS="$HOME/.docker/cli-plugins"
@@ -289,6 +313,8 @@ else
     ok "Docker daemon is already running"
 fi
 
+fi
+
 # ── Step 7: .NET 10 SDK ──────────────────────────────────────────────────────
 
 step 7 $TOTAL_STEPS "Installing .NET 10 SDK"
@@ -337,10 +363,12 @@ check_installed() {
     fi
 }
 
-check_installed docker
-check_installed docker-compose
-if [ "$DOCKER_DAEMON_TYPE" = "colima" ]; then
-    check_installed docker-buildx
+if [ "$OPENMONO_ROLE" != "inference" ]; then
+    check_installed docker
+    check_installed docker-compose
+    if [ "$DOCKER_DAEMON_TYPE" = "colima" ]; then
+        check_installed docker-buildx
+    fi
 fi
 check_installed git
 check_installed jq
@@ -349,6 +377,9 @@ check_installed curl
 check_installed rg
 check_installed python3
 check_installed dotnet
+if [ "$ARCH" = "arm64" ] && [ "$OPENMONO_ROLE" != "agent" ]; then
+    check_installed llama-server
+fi
 
 echo ""
 ok "Prerequisites ready"

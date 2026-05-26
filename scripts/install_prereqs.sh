@@ -45,6 +45,17 @@ if [[ -z "$GPU_MODE" && -f "$HOME/.openmono/.setup_prefs" ]]; then
 fi
 export GPU_MODE
 
+# AMD iGPU mode: restored from prefs or set by user prompt
+AMD_IGPU_MODE="${AMD_IGPU_MODE:-0}"
+if [[ "$AMD_IGPU_MODE" = "0" && -f "$HOME/.openmono/.setup_prefs" ]]; then
+    _saved_amd=$(grep '^AMD_IGPU_MODE=' "$HOME/.openmono/.setup_prefs" 2>/dev/null | cut -d= -f2 | tr -d '[:space:]' || true)
+    if [[ "$_saved_amd" = "1" ]]; then
+        AMD_IGPU_MODE=1
+        _AMD_IGPU_MODE_RESTORED=true
+    fi
+fi
+export AMD_IGPU_MODE
+
 TOTAL_STEPS=8
 
 banner "OpenMono.ai Prerequisites"
@@ -169,6 +180,17 @@ elif grep -qi "0x10de" /sys/bus/pci/devices/*/vendor 2>/dev/null; then
     detail "NVIDIA GPU detected via PCI vendor ID (0x10de)"
 fi
 
+# Detect AMD Ryzen 9 7940HS + Radeon 780M iGPU
+HAS_AMD_780M=false
+_CPU_MODEL=$(grep -m1 "^model name" /proc/cpuinfo 2>/dev/null | sed 's/model name[[:space:]]*:[[:space:]]*//')
+if echo "$_CPU_MODEL" | grep -qi "7940HS"; then
+    if lspci 2>/dev/null | grep -qi "radeon\|amdgpu" \
+        || lsmod 2>/dev/null | grep -q "^amdgpu "; then
+        HAS_AMD_780M=true
+        detail "AMD Ryzen 9 7940HS + Radeon 780M detected"
+    fi
+fi
+
 # Determine GPU mode: explicit flag / persisted pref takes precedence, then auto-detect with prompt
 if [[ -n "$GPU_MODE" ]]; then
     if [[ "${_GPU_MODE_RESTORED:-false}" == "true" ]]; then
@@ -206,13 +228,66 @@ elif [ "$HAS_NVIDIA_HW" = true ] || command -v nvidia-smi &>/dev/null; then
         fi
         echo ""
     fi
+elif [[ "$HAS_AMD_780M" = true && "${OPENMONO_ROLE:-}" != "agent" ]]; then
+    # AMD Ryzen 9 7940HS + Radeon 780M iGPU path
+    GPU_MODE=0  # Keep GPU_MODE=0 so NVIDIA stack is skipped; use AMD_IGPU_MODE for iGPU selection
+    if [[ "${_AMD_IGPU_MODE_RESTORED:-false}" == "true" ]]; then
+        info "Restoring saved iGPU mode from previous session"
+    elif [[ "$AMD_IGPU_MODE" = "1" ]]; then
+        # Already set via env var
+        info "iGPU mode requested"
+    else
+        # Prompt user for CPU vs iGPU
+        echo ""
+        printf "${BLUE}%s${NC}\n" "$(printf '─%.0s' $(seq 1 60))"
+        printf "${BLUE}${BOLD}  AMD Ryzen 9 7940HS + Radeon 780M Detected${NC}\n"
+        printf "${BLUE}%s${NC}\n" "$(printf '─%.0s' $(seq 1 60))"
+        echo ""
+        echo "  This iGPU can run models via Vulkan using system RAM as VRAM."
+        echo ""
+        echo "  1) CPU only   — standard inference (no kernel changes)"
+        echo "  2) iGPU (Vulkan) — Radeon 780M acceleration (modifies kernel config)"
+        echo ""
+        printf "  Choose mode [1=cpu, 2=igpu] [default: 1]: "
+        read -r -n 1 _igpu_choice
+        echo ""
+        _igpu_choice="${_igpu_choice:-1}"
+        if [[ "$_igpu_choice" = "2" ]]; then
+            echo ""
+            printf "  ${YELLOW}${BOLD}WARNING: Experimental${NC}\n"
+            printf "  This will modify your kernel configuration.\n"
+            printf "  Recommended for dedicated inference setups only!\n"
+            echo ""
+            printf "  Press ENTER to continue or Ctrl+C to abort: "
+            read -r _amd_confirm
+            AMD_IGPU_MODE=1
+        fi
+        echo ""
+    fi
+
+    if [[ "$AMD_IGPU_MODE" = "1" ]]; then
+        # Check if GRUB parameters are already active (system already rebooted after previous opt run)
+        if grep -q "amdgpu.gttsize=28672" /proc/cmdline 2>/dev/null; then
+            info "AMD iGPU kernel parameters already active — skipping optimization script"
+        else
+            bash "$SCRIPT_DIR/opt_7940hs.sh" --igpu || {
+                err "AMD iGPU optimization failed"
+                exit 1
+            }
+            # Signal that reboot is needed (set in parent shell, not via export from subshell)
+            AMD_IGPU_REBOOT_PENDING=true
+        fi
+        # Only save pref AFTER completion (whether via opt script or already active)
+        _save_setup_pref "AMD_IGPU_MODE" "1"
+    fi
 else
-    # No NVIDIA hardware detected
+    # No NVIDIA hardware and no AMD iGPU detected
     GPU_MODE=0
 fi
 
 if [ "$GPU_MODE" = 0 ]; then
-    info "GPU mode disabled — skipping CUDA/nvidia-container-toolkit"
+    info "GPU not detected — skipping CUDA/nvidia-container-toolkit"
+    info "Switching to CPU mode automatically"
 else
     ok "GPU mode enabled — installing NVIDIA stack"
 
@@ -523,11 +598,12 @@ if [ "${NVIDIA_REBOOT_PENDING:-false}" = "true" ]; then
         if [[ "$_reboot_choice" == "Y" ]]; then
             touch "$_reboot_done_file"
             echo ""
-            info "After reboot, run: ${BOLD}$REPO_DIR/openmono setup${NC}"
+            info "After reboot, run: ${BOLD}openmono setup${NC}"
             echo ""
             info "Rebooting in 10 seconds (press Ctrl+C to cancel)..."
             sleep 10
             $SUDO reboot
+            exit 0
         else
             warn "Reboot skipped. NVIDIA drivers will not be active until you reboot."
             warn "Run: sudo reboot"
@@ -535,8 +611,47 @@ if [ "${NVIDIA_REBOOT_PENDING:-false}" = "true" ]; then
     fi
 fi
 
-# Write GPU_MODE to the shared env file so install.sh picks it up without re-detecting
+# ── Deferred reboot prompt (AMD iGPU kernel optimizations applied this run) ─────
+
+if [ "${AMD_IGPU_REBOOT_PENDING:-false}" = "true" ]; then
+    echo ""
+    printf "${BLUE}%s${NC}\n" "$(printf '─%.0s' $(seq 1 60))"
+    printf "${BLUE}${BOLD}  Reboot Required${NC}\n"
+    printf "${BLUE}%s${NC}\n" "$(printf '─%.0s' $(seq 1 60))"
+    echo ""
+    info "AMD iGPU kernel optimizations are installed but will only become active after a reboot."
+    echo ""
+    _reboot_invalid=0
+    while true; do
+        [ "$_reboot_invalid" -eq 1 ] && printf "  ${RED}Please press Y or N.${NC}\n\n"
+        printf "  Would you like to reboot now? ${BOLD}(Y/n)${NC}: "
+        read -r -n 1 _reboot_choice
+        echo ""
+        case "${_reboot_choice:-Y}" in
+            [Yy]) _reboot_choice=Y; break ;;
+            [Nn]) _reboot_choice=N; break ;;
+            *)    _reboot_invalid=1 ;;
+        esac
+    done
+
+    if [[ "$_reboot_choice" == "Y" ]]; then
+        echo ""
+        info "After reboot, run: ${BOLD}openmono setup${NC}"
+        echo ""
+        info "Rebooting in 10 seconds (press Ctrl+C to cancel)..."
+        sleep 10
+        $SUDO reboot
+        exit 0
+    else
+        warn "Reboot skipped. AMD iGPU kernel parameters will not be active until you reboot."
+        warn "Run: sudo reboot"
+    fi
+fi
+
+# Write GPU_MODE and AMD_IGPU_MODE to the shared env file so install.sh picks them up without re-detecting
 if [[ -n "${OPENMONO_ENV_FILE:-}" ]]; then
     echo "export GPU_MODE=\"${GPU_MODE:-0}\"" >> "$OPENMONO_ENV_FILE"
-    _log "GPU_MODE=${GPU_MODE:-0} written to env file"
+    echo "export AMD_IGPU_MODE=\"${AMD_IGPU_MODE:-0}\"" >> "$OPENMONO_ENV_FILE"
+    echo "export AMD_IGPU_REBOOT_PENDING=\"${AMD_IGPU_REBOOT_PENDING:-false}\"" >> "$OPENMONO_ENV_FILE"
+    _log "GPU_MODE=${GPU_MODE:-0}, AMD_IGPU_MODE=${AMD_IGPU_MODE:-0}, and AMD_IGPU_REBOOT_PENDING=${AMD_IGPU_REBOOT_PENDING:-false} written to env file"
 fi

@@ -1,7 +1,7 @@
 # Roadmap 
 
 <p align="center">
- <code>April 2026</code>
+ <code>May 2026</code>
 </p>
 
 ---
@@ -18,7 +18,6 @@
 
 ## Coming Next
 
-- [ ] Multimodal input — images and file attachments in user messages
 - [ ] Parallel sub-agent management — spawn and coordinate multiple agents concurrently
 - [ ] Playwright MCP — browser automation as a native tool
 - [ ] MCP manager — discover, add, and configure MCP servers from within the agent
@@ -57,6 +56,7 @@
 - [x] Doom loop detection improved — aborts early if the same tool sequence repeats, preventing runaway agent loops
 - [x] Plan mode integrated — restricts the agent to read-only tools for safe exploration before making changes
 - [x] 12 GB and 16 GB GPU support — installer now detects VRAM tier and selects the appropriate model automatically
+- [x] Vision / multimodal input — `@image.png` syntax in chat, `FileRead` for images, mmproj auto-downloaded at setup, smart resize to fit VRAM budget
 
 ---
 

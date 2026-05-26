@@ -30,24 +30,40 @@ INSTALL_DIR="$(dirname "$SCRIPT_DIR")"  # repo root (parent of scripts/)
 # shellcheck source=lib/log.sh
 source "$SCRIPT_DIR/lib/log.sh"
 
+# ── Context size presets (tokens) — edit here to change globally ─────────────
+CTX_24G=196608       # GPU 24GB+  q8_0 KV  (~8GB KV + 15GB weights ≈ 23GB)
+CTX_16G=180224       # GPU 16GB   q4_0 KV  (~3.7GB KV + 12GB weights ≈ 16GB)
+CTX_12G=196608       # GPU 12GB   q4_0 KV  (9B weights ~5GB, fits)
+CTX_CPU=196608       # CPU/Vulkan q8_0 KV
+CTX_VISION=172032    # 24GB+ tier + mmproj — 723 MiB free at rest; vision encoder needs ~474 MiB burst
+CTX_VISION_16G=98304  # 16GB tier + mmproj — ~1GB less KV than 128k, gives vision encoder burst headroom
+
 # MODEL_ACCURACY, MODEL_ALIAS, and _MODEL_LABEL.
 select_model() {
     case "${1:-0}" in
         24) MODEL_NAME="Qwen3.6-27B-Q4_K_M.gguf"
             MODEL_URL="https://huggingface.co/unsloth/Qwen3.6-27B-GGUF/resolve/main/Qwen3.6-27B-Q4_K_M.gguf"
             MODEL_ACCURACY="full"
+            MODEL_MMPROJ="mmproj-qwen3.6-27B-F16.gguf"
+            MODEL_MMPROJ_URL="https://huggingface.co/unsloth/Qwen3.6-27B-GGUF/resolve/main/mmproj-F16.gguf"
             _MODEL_LABEL="Qwen3.6-27B-Q4_K_M (~15GB) [GPU 24GB+ — full accuracy]" ;;
         16) MODEL_NAME="Qwen3.6-27B-UD-IQ3_XXS.gguf"
             MODEL_URL="https://huggingface.co/unsloth/Qwen3.6-27B-GGUF/resolve/main/Qwen3.6-27B-UD-IQ3_XXS.gguf"
             MODEL_ACCURACY="lower"
+            MODEL_MMPROJ="mmproj-qwen3.6-27B-F16.gguf"
+            MODEL_MMPROJ_URL="https://huggingface.co/unsloth/Qwen3.6-27B-GGUF/resolve/main/mmproj-F16.gguf"
             _MODEL_LABEL="Qwen3.6-27B-UD-IQ3_XXS (~12GB) [GPU 16GB — lower accuracy]" ;;
         12) MODEL_NAME="Qwen3.5-9B-Q4_K_M.gguf"
             MODEL_URL="https://huggingface.co/unsloth/Qwen3.5-9B-GGUF/resolve/main/Qwen3.5-9B-Q4_K_M.gguf"
             MODEL_ACCURACY="lower"
+            MODEL_MMPROJ="mmproj-qwen3.5-9B-F16.gguf"
+            MODEL_MMPROJ_URL="https://huggingface.co/unsloth/Qwen3.5-9B-GGUF/resolve/main/mmproj-F16.gguf"
             _MODEL_LABEL="Qwen3.5-9B-Q4_K_M (~5GB) [GPU 12GB — lower accuracy]" ;;
         *)  MODEL_NAME="Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf"
             MODEL_URL="https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF/resolve/main/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf"
             MODEL_ACCURACY="standard"
+            MODEL_MMPROJ="mmproj-qwen3.6-35B-A3B-F16.gguf"
+            MODEL_MMPROJ_URL="https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF/resolve/main/mmproj-F16.gguf"
             _MODEL_LABEL="Qwen3.6-35B-A3B (~17.6GB) [CPU]" ;;
     esac
     MODEL_ALIAS="${MODEL_NAME%.gguf}"
@@ -79,10 +95,27 @@ if command -v docker &>/dev/null && ! docker info &>/dev/null 2>&1; then
     fi
 fi
 
-# Source the shared env file written by install_prereqs.sh (GPU_MODE, etc.)
+# Source the shared env file written by install_prereqs.sh (GPU_MODE, AMD_IGPU_MODE, etc.)
 # shellcheck source=/dev/null
 if [[ -n "${OPENMONO_ENV_FILE:-}" ]] && [[ -f "$OPENMONO_ENV_FILE" ]]; then
     source "$OPENMONO_ENV_FILE"
+fi
+
+# Verify reboot if AMD iGPU optimizations were applied
+if [[ "${AMD_IGPU_MODE:-0}" = "1" ]]; then
+    if ! grep -q "amdgpu.gttsize=28672" /proc/cmdline 2>/dev/null; then
+        err "AMD iGPU optimizations have been applied but system has not been rebooted yet."
+        err ""
+        err "The GRUB kernel parameters and system tuning will not take effect until you reboot."
+        err "This will result in OOM errors when starting the llama-server."
+        err ""
+        err "Please reboot now:"
+        err "  sudo reboot"
+        err ""
+        err "After reboot, run setup again:"
+        err "  openmono setup"
+        exit 1
+    fi
 fi
 
 # Role selector — drives which of the 8 install steps actually run.
@@ -216,6 +249,8 @@ _GPU_TIER=0
 MODEL_NAME=""
 MODEL_ACCURACY=""
 MODEL_ALIAS=""
+MODEL_MMPROJ=""
+MODEL_MMPROJ_URL=""
 if [ "$OPENMONO_ROLE" != "agent" ]; then
     if [ "${GPU_MODE:-0}" = "1" ]; then
         if command -v nvidia-smi &>/dev/null; then
@@ -244,6 +279,9 @@ if [ "$OPENMONO_ROLE" != "agent" ]; then
     fi
     select_model "$_GPU_TIER"
     ok "Model selected: $MODEL_NAME"
+    if [ -n "${MODEL_MMPROJ:-}" ]; then
+        detail "Vision projector: $MODEL_MMPROJ"
+    fi
 fi
 
 # Display tool versions (prerequisites already verified above)
@@ -340,6 +378,30 @@ if [ "$OPENMONO_ROLE" != "agent" ]; then
 
         ok "Model downloaded ($(du -h "$MODEL_FILE" | cut -f1))"
     fi
+
+    # ── mmproj (vision projector) ────────────────────────────────────────────
+    if [ -z "${MODEL_MMPROJ:-}" ]; then
+        info "No mmproj configured for this model — vision will be disabled"
+    else
+        MMPROJ_FILE="$MODEL_DIR/$MODEL_MMPROJ"
+        MMPROJ_MIN_BYTES=$((100 * 1024 * 1024))  # 100 MB sanity check (real file ~900 MB)
+        if [ -f "$MMPROJ_FILE" ] && [ "$(model_size "$MMPROJ_FILE")" -gt "$MMPROJ_MIN_BYTES" ]; then
+            ok "mmproj already present ($(du -h "$MMPROJ_FILE" | cut -f1))"
+        else
+            if [ -f "$MMPROJ_FILE" ]; then
+                warn "Existing mmproj looks incomplete — removing"
+                rm -f "$MMPROJ_FILE"
+            fi
+            info "Downloading mmproj: $MODEL_MMPROJ (~900 MB)"
+            if ! run_live curl -L --fail --progress-bar -o "$MMPROJ_FILE" "$MODEL_MMPROJ_URL"; then
+                rm -f "$MMPROJ_FILE"
+                warn "mmproj download failed — vision will be unavailable"
+                MODEL_MMPROJ=""
+            else
+                ok "mmproj downloaded ($(du -h "$MMPROJ_FILE" | cut -f1))"
+            fi
+        fi
+    fi
 fi
 
 # ── Step 5: code-review-graph (agent + full only) ────────────────────────────
@@ -403,6 +465,8 @@ if [ "$OPENMONO_ROLE" != "agent" ]; then
 
     if [ "${GPU_MODE:-0}" = "1" ]; then
         info "GPU mode (selected during prerequisites)"
+    elif [ "${AMD_IGPU_MODE:-0}" = "1" ]; then
+        info "AMD iGPU mode (Vulkan)"
     else
         info "CPU mode"
     fi
@@ -413,15 +477,27 @@ if [ "$OPENMONO_ROLE" != "agent" ]; then
         # 24GB tier: q8 kv cache (high quality); 16GB/12GB tiers: q4 kv cache (saves VRAM)
         if [ "$_GPU_TIER" -ge 24 ]; then
             _KV_K="q8_0"; _KV_V="q8_0"
-            _CTX=196608
+            _CTX=$CTX_24G
         elif [ "$_GPU_TIER" -ge 16 ]; then
             _KV_K="q4_0"; _KV_V="q4_0"
-            _CTX=180224
+            _CTX=$CTX_16G
         else
             _KV_K="q4_0"; _KV_V="q4_0"
-            _CTX=196608
+            _CTX=$CTX_12G
+        fi
+        # mmproj loads ~1–2 GB into VRAM — pull context back to stay within budget.
+        if [ -n "${MODEL_MMPROJ:-}" ]; then
+            _CTX_ORIG=$_CTX
+            if [ "$_GPU_TIER" -ge 24 ]; then
+                _CTX=$CTX_VISION
+            else
+                _CTX=$CTX_VISION_16G
+            fi
+            detail "Vision enabled: context reduced from $(( _CTX_ORIG / 1024 ))k → $(( _CTX / 1024 ))k to fit mmproj in VRAM"
         fi
         [ "$MODEL_ACCURACY" = "lower" ] && info "Lower accuracy model selected — q4 kv cache enabled to fit $(( (_VRAM_MB + 512) / 1024 ))GB VRAM"
+        # Append mmproj flag inline with --metrics; empty string when no projector configured.
+        MMPROJ_OPT="${MODEL_MMPROJ:+--mmproj /models/${MODEL_MMPROJ} --image-min-tokens 1024 --image-max-tokens 1280}"
         info "Writing GPU override: $OVERRIDE_FILE"
         cat > "$OVERRIDE_FILE" <<EOF
 # GPU configuration (auto-generated by install.sh — ${MODEL_ACCURACY:-full} accuracy)
@@ -444,7 +520,7 @@ services:
       --parallel 1
       --jinja
       --reasoning off
-      --metrics
+      --metrics ${MMPROJ_OPT}
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
@@ -457,7 +533,7 @@ services:
               capabilities: [gpu]
 EOF
     ok "GPU override written"
-    printf "     ${DIM}model: $MODEL_NAME  ·  ctx: $(( _CTX / 1024 ))k  ·  kv: ${_KV_K}  ·  layers: 99  ·  accuracy: ${MODEL_ACCURACY:-full}${NC}\n"
+    printf "     ${DIM}model: $MODEL_NAME  ·  ctx: $(( _CTX / 1024 ))k  ·  kv: ${_KV_K}  ·  layers: 99  ·  accuracy: ${MODEL_ACCURACY:-full}  ·  vision: ${MODEL_MMPROJ:-disabled}${NC}\n"
     printf "     ${DIM}config: $OVERRIDE_FILE  (restart: docker compose up -d llama-server)${NC}\n"
 
     printf "\n  ${BOLD}${CYAN}Tuning knobs${NC}\n"
@@ -466,6 +542,17 @@ EOF
     printf "     ${DIM}--cache-type-k/v  f16 (best) → q8_0 → q5_1 → q4_1 → q4_0 (least VRAM)${NC}\n"
     printf "     ${DIM}--n-gpu-layers    99=all on GPU; lower to spill layers to CPU RAM${NC}\n"
     printf "     ${DIM}--parallel N      N concurrent slots, each costs ctx-size of KV cache${NC}\n"
+    if [ -n "${MODEL_MMPROJ:-}" ]; then
+    printf "\n  ${BOLD}${CYAN}Vision (enabled by default)${NC}\n"
+    printf "     ${DIM}Vision encoder (mmproj) is loaded alongside the model${NC}\n"
+    printf "     ${DIM}  · GPU: uses ~1–2 GB extra VRAM — context reduced $(( _CTX_ORIG / 1024 ))k → $(( _CTX / 1024 ))k to compensate${NC}\n"
+    printf "     ${DIM}  · CPU: uses ~1–2 GB extra RAM — same context reduction applies${NC}\n"
+    printf "     ${DIM}Use: @image.png or @screenshot.png in chat, or ask the agent to read any image file${NC}\n"
+    printf "\n     ${DIM}To disable vision and recover $(( (_CTX_ORIG - _CTX) / 1024 ))k extra context:${NC}\n"
+    printf "     ${DIM}  1.  docker/.env → MODEL_MMPROJ=  (clear the value)${NC}\n"
+    printf "     ${DIM}  2.  docker/.env → CTX_SIZE=%s  (restore full context)${NC}\n" "$_CTX_ORIG"
+    printf "     ${DIM}  3.  docker compose up -d llama-server${NC}\n"
+    fi
 
     printf "\n  ${BOLD}${CYAN}Swapping models${NC}\n"
     printf "     ${DIM}Any GGUF works — different family or a different quant of this model${NC}\n"
@@ -477,23 +564,106 @@ EOF
     printf "     ${DIM}IQ:      IQ3_XXS / IQ4_XS match one tier higher quality at lower size${NC}\n"
     printf "     ${DIM}MoE:     A3B / A22B suffix — only active params computed, runs faster${NC}\n"
     printf "     ${DIM}Tier or GPU↔CPU change: re-run openmono setup${NC}\n"
+    if [ -n "${MODEL_MMPROJ:-}" ]; then
+    printf "     ${DIM}Vision: if swapping to a different model family, update MODEL_MMPROJ= too${NC}\n"
+    printf "     ${DIM}  mmproj must match the model base — search HuggingFace for '<model-name> mmproj gguf'${NC}\n"
+    fi
+elif [ "${AMD_IGPU_MODE:-0}" = "1" ]; then
+    info "Writing AMD iGPU (Vulkan) override: $OVERRIDE_FILE"
+
+    # Context size reduction for mmproj (same as CPU branch)
+    _CTX_ORIG=196608
+    _CTX=196608
+    if [ -n "${MODEL_MMPROJ:-}" ]; then
+        _CTX=$CTX_VISION
+        detail "Vision enabled: context reduced from $(( _CTX_ORIG / 1024 ))k → $(( CTX_VISION / 1024 ))k to fit mmproj in GTT allocation"
+    fi
+    MMPROJ_OPT="${MODEL_MMPROJ:+--mmproj /models/${MODEL_MMPROJ} --image-min-tokens 1024 --image-max-tokens 1280}"
+
+    cat > "$OVERRIDE_FILE" <<EOF
+# AMD Radeon 780M iGPU / Vulkan configuration (auto-generated by install.sh)
+services:
+  llama-server:
+    image: ghcr.io/ggml-org/llama.cpp:server-vulkan-b9070
+    devices:
+      - /dev/dri:/dev/dri
+    group_add:
+      - "44"
+      - "109"
+    volumes:
+      - ~/openmono.ai/models:/models
+    ports:
+      - "\${LLAMA_PORT:-7474}:\${LLAMA_PORT:-7474}"
+    shm_size: "4gb"
+    environment:
+      - GGML_VULKAN_DEVICE=0
+      - RADV_PERFTEST=compute
+    command: >
+      --model /models/\${MODEL_NAME}
+      --alias \${MODEL_ALIAS:-model}
+      --host 0.0.0.0
+      --port 7474
+      --ctx-size $_CTX
+      --no-mmap
+      --threads 8
+      --threads-batch 8
+      --batch-size 512
+      --ubatch-size 256
+      -ngl 99
+      --n-gpu-layers 99
+      --flash-attn on
+      --cache-type-k q8_0
+      --cache-type-v q8_0
+      --parallel 1
+      --jinja
+      --reasoning off
+      --metrics ${MMPROJ_OPT}
+      \${LLAMA_API_KEY:+--api-key \${LLAMA_API_KEY}}
+EOF
+    ok "AMD iGPU override written"
+    printf "     ${DIM}model: $MODEL_NAME  ·  ctx: $(( _CTX / 1024 ))k  ·  kv: q8_0  ·  gpu-layers: 99  ·  vision: ${MODEL_MMPROJ:-disabled}${NC}\n"
+    printf "     ${DIM}config: $OVERRIDE_FILE  (restart: docker compose up -d llama-server)${NC}\n"
+
+    printf "\n  ${BOLD}${CYAN}Tuning knobs${NC}\n"
+    printf "     ${DIM}--ctx-size N      up to 196608 (GTT limits: ~28GB system RAM as VRAM)${NC}\n"
+    printf "     ${DIM}--cache-type-k/v  f16 (best) → q8_0 → q5_1 → q4_1 → q4_0 (least RAM)${NC}\n"
+    printf "     ${DIM}--no-mmap         prevents kernel double-mapping with GTT allocation${NC}\n"
+
+    printf "\n  ${BOLD}${CYAN}Swapping models${NC}\n"
+    printf "     ${DIM}Any GGUF works — different family or a different quant of this model${NC}\n"
+    printf "     ${DIM}1.  Copy .gguf into \$INSTALL_DIR/models/${NC}\n"
+    printf "     ${DIM}2.  docker/.env → MODEL_NAME=file.gguf  MODEL_ALIAS=file${NC}\n"
+    printf "     ${DIM}3.  docker compose up -d llama-server${NC}\n"
+    printf "     \n"
+    printf "     ${DIM}Quants:  Q6_K > Q5_K_M > Q4_K_M > Q3_K_M  (quality vs RAM)${NC}\n"
+    printf "     ${DIM}IQ:      IQ3_XXS / IQ4_XS match one tier higher quality at lower size${NC}\n"
+    printf "     ${DIM}MoE:     A3B / A22B suffix — only active params computed, runs faster${NC}\n"
+    printf "     ${DIM}Architecture: Radeon 780M + 28GB GTT window (GRUB configured)${NC}\n"
+
 else
     info "Writing CPU override: $OVERRIDE_FILE"
     # Thread count tuned to physical cores (SMT hurts llama.cpp throughput).
     CPU_THREADS="$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 8)"
     PHYS_CORES="$(lscpu -b -p=Core,Socket 2>/dev/null | grep -v '^#' | sort -u | wc -l)"
     [ "${PHYS_CORES:-0}" -gt 0 ] && CPU_THREADS="$PHYS_CORES"
+    _CTX_ORIG=$CTX_CPU
+    _CTX=$CTX_CPU
+    if [ -n "${MODEL_MMPROJ:-}" ]; then
+        _CTX=$CTX_VISION
+        detail "Vision enabled: context reduced from $(( _CTX_ORIG / 1024 ))k → $(( CTX_VISION / 1024 ))k to fit mmproj in RAM"
+    fi
+    MMPROJ_OPT="${MODEL_MMPROJ:+--mmproj /models/${MODEL_MMPROJ} --image-min-tokens 1024 --image-max-tokens 1280}"
     cat > "$OVERRIDE_FILE" <<EOF
-# CPU/Vulkan configuration (auto-generated by install.sh)
+# CPU-only configuration (auto-generated by install.sh)
 services:
   llama-server:
-    image: ghcr.io/ggml-org/llama.cpp:server-vulkan
+    image: ghcr.io/ggml-org/llama.cpp:server
     command: >
       --model /models/\${MODEL_NAME}
       --alias \${MODEL_ALIAS:-model}
       --host 0.0.0.0
       --port 7474
-      --ctx-size 196608
+      --ctx-size $_CTX
       --threads $CPU_THREADS
       --threads-batch $CPU_THREADS
       --batch-size 2048
@@ -504,11 +674,11 @@ services:
       --parallel 1
       --jinja
       --reasoning off
-      --metrics
+      --metrics ${MMPROJ_OPT}
       \${LLAMA_API_KEY:+--api-key \${LLAMA_API_KEY}}
 EOF
     ok "CPU override written"
-    printf "     ${DIM}model: $MODEL_NAME  ·  ctx: 192k  ·  kv: q8_0  ·  threads: $CPU_THREADS (physical cores)${NC}\n"
+    printf "     ${DIM}model: $MODEL_NAME  ·  ctx: $(( _CTX / 1024 ))k  ·  kv: q8_0  ·  threads: $CPU_THREADS (physical cores)  ·  vision: ${MODEL_MMPROJ:-disabled}${NC}\n"
     printf "     ${DIM}config: $OVERRIDE_FILE  (restart: docker compose up -d llama-server)${NC}\n"
 
     printf "\n  ${BOLD}${CYAN}Tuning knobs${NC}\n"
@@ -516,6 +686,17 @@ EOF
     printf "     ${DIM}                  presets: 32k=32768  64k=65536  128k=131072  192k=196608${NC}\n"
     printf "     ${DIM}--cache-type-k/v  f16 (best) → q8_0 → q5_1 → q4_1 → q4_0 (least RAM)${NC}\n"
     printf "     ${DIM}--threads N       physical cores optimal ($CPU_THREADS); SMT/HT hurts llama.cpp throughput${NC}\n"
+    if [ -n "${MODEL_MMPROJ:-}" ]; then
+    printf "\n  ${BOLD}${CYAN}Vision (enabled by default)${NC}\n"
+    printf "     ${DIM}Vision encoder (mmproj) is loaded alongside the model${NC}\n"
+    printf "     ${DIM}  · GPU: uses ~1–2 GB extra VRAM — context reduced $(( _CTX_ORIG / 1024 ))k → $(( CTX_VISION / 1024 ))k to compensate${NC}\n"
+    printf "     ${DIM}  · CPU: uses ~1–2 GB extra RAM — same context reduction applies${NC}\n"
+    printf "     ${DIM}Use: @image.png or @screenshot.png in chat, or ask the agent to read any image file${NC}\n"
+    printf "\n     ${DIM}To disable vision and recover $(( (_CTX_ORIG - CTX_VISION) / 1024 ))k extra context:${NC}\n"
+    printf "     ${DIM}  1.  docker/.env → MODEL_MMPROJ=  (clear the value)${NC}\n"
+    printf "     ${DIM}  2.  docker/.env → CTX_SIZE=%s  (restore full context)${NC}\n" "$_CTX_ORIG"
+    printf "     ${DIM}  3.  docker compose up -d llama-server${NC}\n"
+    fi
 
     printf "\n  ${BOLD}${CYAN}Swapping models${NC}\n"
     printf "     ${DIM}Any GGUF works — different family or a different quant of this model${NC}\n"
@@ -527,6 +708,10 @@ EOF
     printf "     ${DIM}IQ:      IQ3_XXS / IQ4_XS match one tier higher quality at lower size${NC}\n"
     printf "     ${DIM}MoE:     A3B / A22B suffix — only active params computed, runs faster${NC}\n"
     printf "     ${DIM}Switch to GPU: re-run openmono setup${NC}\n"
+    if [ -n "${MODEL_MMPROJ:-}" ]; then
+    printf "     ${DIM}Vision: if swapping to a different model family, update MODEL_MMPROJ= too${NC}\n"
+    printf "     ${DIM}  mmproj must match the model base — search HuggingFace for '<model-name> mmproj gguf'${NC}\n"
+    fi
 
     # ── CPU tuning: request the 'performance' power profile ────────────────
     # llama.cpp on CPU is limited by sustained clock speed. The default
@@ -556,11 +741,17 @@ fi
 
 DOCKER_ENV_FILE="$INSTALL_DIR/docker/.env"
 if [ -f "$DOCKER_ENV_FILE" ]; then
-    grep -v -E "^MODEL_NAME=|^MODEL_ALIAS=" "$DOCKER_ENV_FILE" > "${DOCKER_ENV_FILE}.tmp" || true
+    grep -v -E "^MODEL_NAME=|^MODEL_ALIAS=|^MODEL_MMPROJ=|^OPENMONO_VISION_ENABLED=|^CTX_SIZE=" "$DOCKER_ENV_FILE" > "${DOCKER_ENV_FILE}.tmp" || true
     mv "${DOCKER_ENV_FILE}.tmp" "$DOCKER_ENV_FILE"
 fi
-printf "MODEL_NAME=%s\nMODEL_ALIAS=%s\n" "$MODEL_NAME" "$MODEL_ALIAS" >> "$DOCKER_ENV_FILE"
-detail "Persisted MODEL_NAME=$MODEL_NAME to $DOCKER_ENV_FILE"
+printf "MODEL_NAME=%s\nMODEL_ALIAS=%s\nMODEL_MMPROJ=%s\nCTX_SIZE=%s\n" "$MODEL_NAME" "$MODEL_ALIAS" "${MODEL_MMPROJ:-}" "${_CTX:-$CTX_CPU}" >> "$DOCKER_ENV_FILE"
+if [ -n "${MODEL_MMPROJ:-}" ]; then
+    printf "OPENMONO_VISION_ENABLED=1\n" >> "$DOCKER_ENV_FILE"
+    detail "Persisted MODEL_NAME=$MODEL_NAME MODEL_MMPROJ=$MODEL_MMPROJ (vision enabled) to $DOCKER_ENV_FILE"
+else
+    printf "OPENMONO_VISION_ENABLED=0\n" >> "$DOCKER_ENV_FILE"
+    detail "Persisted MODEL_NAME=$MODEL_NAME (vision disabled — no mmproj) to $DOCKER_ENV_FILE"
+fi
 
 fi  # End of Step 6 (skipped on agent role)
 
@@ -664,19 +855,16 @@ fi  # End of Step 8 (skipped on agent role)
 # IMPORTANT: we use a PATH entry (not an alias) because an alias would shadow
 # all subcommands with a single fixed invocation.
 
-# Shell rc file updates are handled by openmono cmd_setup after installation completes
-# This ensures we only update the appropriate files for the user's actual shell
-
 # Install a symlink to /usr/local/bin when possible so the CLI is
-# immediately available (no shell reload needed). Soft-fail if not writable.
-if [ -w /usr/local/bin ] || [ -n "${SUDO:-}" ]; then
-    if [ -w /usr/local/bin ]; then
-        ln -sf "$INSTALL_DIR/openmono" /usr/local/bin/openmono 2>/dev/null && \
-            detail "Symlinked /usr/local/bin/openmono -> $INSTALL_DIR/openmono"
+# immediately available (no shell reload needed).
+if [ -w /usr/local/bin ]; then
+    if ln -sf "$INSTALL_DIR/openmono" /usr/local/bin/openmono 2>/dev/null; then
+        detail "Symlinked /usr/local/bin/openmono -> $INSTALL_DIR/openmono"
     else
-        sudo ln -sf "$INSTALL_DIR/openmono" /usr/local/bin/openmono 2>/dev/null && \
-            detail "Symlinked /usr/local/bin/openmono -> $INSTALL_DIR/openmono"
+        warn "Could not create /usr/local/bin/openmono symlink (permission issue)"
     fi
+else
+    detail "/usr/local/bin is not writable — shell integration will be handled by openmono cmd_setup"
 fi
 
 # Installation completed successfully — clear persisted setup choices so a

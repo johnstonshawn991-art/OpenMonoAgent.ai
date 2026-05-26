@@ -10,6 +10,7 @@ internal sealed class AnsiSuggestionOverlay(AppConfig config, AnsiPainter painte
     private List<(string Name, string Desc)>? _allCommands;
     private List<(string Name, string Desc)> _filteredCmds = [];
     private int _suggestionIdx = -1;
+    private int _lastDrawnCount = 0;
 
     private List<string> _atResults = [];
     private int _atSearchIdx = -1;
@@ -105,6 +106,19 @@ internal sealed class AnsiSuggestionOverlay(AppConfig config, AnsiPainter painte
         var convH  = layout.ConvH;
         var max    = Math.Min(_filteredCmds.Count, 8);
 
+        // Clear any leftover rows above the new (possibly shorter) list. The
+        // overlay is bottom-aligned, so a previous taller list leaves stale
+        // rows above the new top when the filter narrows. Old rows occupy
+        // convH-_lastDrawnCount+1..convH; new rows occupy convH-max+1..convH;
+        // the stale band is convH-_lastDrawnCount+1..convH-max.
+        for (var i = 0; i < _lastDrawnCount - max; i++)
+        {
+            var row = convH - _lastDrawnCount + i + 1;
+            if (row < 1) continue;
+            painter.MoveTo(1, row);
+            painter.Write($"{AnsiPainter.BgMain}{new string(' ', mainW)}{AnsiPainter.R}");
+        }
+
         for (var i = 0; i < max; i++)
         {
             var row = convH - max + i + 1;
@@ -121,6 +135,7 @@ internal sealed class AnsiSuggestionOverlay(AppConfig config, AnsiPainter painte
                     $"{AnsiPainter.BgMain}{AnsiPainter.Fk}  {name,-14} {desc}{AnsiPainter.R}" +
                     $"{AnsiPainter.BgMain}{AnsiPainter.Pad(Math.Max(0, mainW - 17 - AnsiPainter.VisLen(desc)))}{AnsiPainter.R}");
         }
+        _lastDrawnCount = max;
         AnsiPainter.Flush();
     }
 
@@ -130,7 +145,7 @@ internal sealed class AnsiSuggestionOverlay(AppConfig config, AnsiPainter painte
         var layout = painter.ComputeLayout(bgText);
         var mainW  = layout.MainW;
         var convH  = layout.ConvH;
-        var max    = Math.Min(_filteredCmds.Count > 0 ? _filteredCmds.Count : 8, 8);
+        var max    = _lastDrawnCount > 0 ? _lastDrawnCount : Math.Min(_filteredCmds.Count, 8);
 
         for (var i = 0; i < max; i++)
         {
@@ -142,6 +157,7 @@ internal sealed class AnsiSuggestionOverlay(AppConfig config, AnsiPainter painte
 
         _filteredCmds.Clear();
         _suggestionIdx = -1;
+        _lastDrawnCount = 0;
         AnsiPainter.Flush();
         painter.PaintConvThrottled(force: true);
     }

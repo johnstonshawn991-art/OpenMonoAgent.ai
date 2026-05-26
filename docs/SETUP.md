@@ -7,7 +7,7 @@
 | **OS** | Ubuntu 26.04 LTS (recommended) · 25.10 |
 | **GPU mode** | NVIDIA GPU · 12 GB VRAM minimum · 24 GB recommended |
 | **CPU mode** | 24 GB RAM |
-| **Disk** | ~20 GB free for the model download |
+| **Disk** | ~22 GB free (model + ~900 MB vision projector) |
 
 ---
 
@@ -80,12 +80,14 @@ If the NVIDIA drivers are being installed fresh, a reboot is required:
 
 The only slow step. The installer picks the right model based on your VRAM:
 
-| VRAM | Model | Size | Accuracy |
-|------|-------|------|----------|
-| 24 GB+ | Qwen3.6-27B-Q4_K_M | ~15.5 GB | Full |
-| 16 GB | Qwen3.6-35B-A3B-UD-IQ3_S | ~12 GB | Lower |
-| 12 GB | Qwen3.5-9B-Q4_K_M | ~5 GB | Lower |
-| CPU | Qwen3.6-35B-A3B-UD-Q4_K_XL | ~17.6 GB | Full |
+| VRAM | Model | Size | Accuracy | Context (vision on) |
+|------|-------|------|----------|---------------------|
+| 24 GB+ | Qwen3.6-27B-Q4_K_M | ~15.5 GB | Full | 168k |
+| 16 GB | Qwen3.6-35B-A3B-UD-IQ3_S | ~12 GB | Lower | 96k |
+| 12 GB | Qwen3.5-9B-Q4_K_M | ~5 GB | Lower | 168k |
+| CPU | Qwen3.6-35B-A3B-UD-Q4_K_XL | ~17.6 GB | Full | 168k |
+
+The installer also downloads the **multimodal projector** (mmproj, ~900 MB) for each model, which enables vision. A reduced context size is set automatically to keep the projector within VRAM/RAM budget. To disable vision and recover the extra context, see [disabling vision](#vision) below.
 
 > [!NOTE]
 > These are the default models for each tier. If you have more VRAM or RAM available, you can swap to a higher quant for better accuracy — or a lower quant to free up memory. Context size is also configurable: a larger window gives the agent more working memory but requires more RAM. Both can be changed in `settings.json` via `llm.model` and `llm.contextSize`, or by editing `docker/docker-compose.override.yml` directly.
@@ -307,6 +309,71 @@ openmono tunnel logs     # tail frpc logs
 > ```bash
 > openmono config set llm.api_key <value-from-inference-box>
 > ```
+
+---
+
+## Vision
+
+Vision is enabled by default when the mmproj is present. Set `OPENMONO_VISION_ENABLED=1` (or add `"vision_enabled": true` to `settings.json`) so the agent accepts and processes images.
+
+### Attaching images in chat
+
+Use the `@filename` syntax to attach an image alongside your message:
+
+```
+@screenshot.png what's wrong with this UI?
+@diagram.jpg explain this architecture
+```
+
+Supported formats: PNG, JPG, JPEG, GIF, WebP. Images are automatically compressed before being sent — see [Image compression](#image-compression) below.
+
+You can also ask the agent to read an image file directly:
+
+```
+Read src/assets/logo.png and describe it
+```
+
+### Tuning
+
+**Image token budget** — controls how many tokens each image is allocated in the context window. Set in `docker/docker-compose.override.yml`:
+
+```
+--image-min-tokens 1024   # minimum tokens per image (lower = faster, less detail)
+--image-max-tokens 1280   # cap per image — raise to 2048 for more detail, costs more context
+```
+
+A single image at the default budget uses ~1024–1280 tokens. If you're sending multiple images per message, reduce `--image-max-tokens` to keep context usage predictable.
+
+**Image compression** — handled client-side by [SixLabors.ImageSharp](https://sixlabors.com/products/imagesharp/) before the image reaches the model:
+
+- Images above ~1.3 MP (≈ 1280×1024) are resized down, keeping aspect ratio
+- Re-encoded as JPEG at 90% quality
+- This happens transparently in the CLI — the model always receives a compact, correctly-sized image regardless of the original file size
+
+### VRAM usage during a vision session
+
+VRAM at startup and VRAM mid-session are different things. When the server first loads, the model and mmproj are resident and the remaining headroom looks comfortable. During inference, two things grow on top of that: the **KV cache** (every processed token occupies space here) and a **prompt cache** (llama.cpp caches KV states from previous requests to speed up repeated context — defaults to 8192 MiB). Both accumulate as the conversation continues.
+
+Each image adds roughly 1,000–1,280 tokens to the KV cache on top of the text. After a few exchanges the headroom that looked available at startup may be significantly reduced, and the vision encoder needs a short burst of extra VRAM each time it processes a new image. If that burst can't be satisfied, the server will crash with an out-of-memory error.
+
+If you run into this, two knobs in `docker/docker-compose.override.yml`:
+
+```
+--cache-ram 2048    # cap prompt cache at 2048 MiB instead of the default 8192 MiB
+--cache-ram 0       # disable prompt cache entirely — maximum headroom, no prefix caching
+--cache-reuse 256   # raise the reuse threshold — only reuse cached KV if ≥256 tokens match;
+                    # doesn't reduce cache size but avoids cache thrash on short prompts
+```
+
+### Disabling vision
+
+The mmproj uses ~1–2 GB of VRAM/RAM and reduces the context window to compensate (e.g. 192k → 168k on the 24 GB tier). To disable it and recover that context:
+
+1. Open `docker/.env` and clear `MODEL_MMPROJ=` (set it to empty)
+2. Restore the full context size: e.g. `CTX_SIZE=196608` (the value printed during setup)
+3. Restart llama-server: `docker compose up -d llama-server`
+
+Or set `OPENMONO_VISION_ENABLED=0` to prevent the CLI from sending images without unloading the projector from the server.
 
 ---
 

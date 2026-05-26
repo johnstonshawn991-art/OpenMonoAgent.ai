@@ -44,7 +44,7 @@ public sealed class EnterPlanModeTool : ToolBase
         """;
 
     public override PermissionLevel DefaultPermission => PermissionLevel.AutoAllow;
-    // Session-state flip only — no filesystem / shell side effects.
+
     public override bool IsReadOnly => true;
 
     protected override SchemaBuilder DefineSchema() => new SchemaBuilder()
@@ -77,8 +77,8 @@ public sealed class ExitPlanModeTool : ToolBase
         """;
 
     public override PermissionLevel DefaultPermission => PermissionLevel.AutoAllow;
-    // Must be read-only: the plan-mode gate would otherwise block the one tool that
-    // lifts plan mode, trapping the agent in a doom loop.
+
+
     public override bool IsReadOnly => true;
 
     protected override SchemaBuilder DefineSchema() => new SchemaBuilder()

@@ -19,6 +19,64 @@ INSTALL_DIR="$(dirname "$SCRIPT_DIR")"  # repo root (parent of scripts/)
 # shellcheck source=lib/log.sh
 source "$SCRIPT_DIR/lib/log.sh"
 
+# ── Context size presets (tokens) — edit here to change globally ──────────────
+CTX_48G=196608       # >=48 GB Metal  q8_0 KV
+CTX_32G=65536        # 32 GB Metal
+CTX_16G=16384        # 16 GB Metal
+CTX_8G=8192          # <16 GB Metal
+CTX_VISION=172032    # >=48 GB + mmproj  (encoder needs ~474 MiB burst)
+CTX_VISION_32G=49152 # 32 GB + mmproj   (~25% reduction)
+CTX_VISION_16G=12288 # 16 GB + mmproj   (~25% reduction)
+
+# Selects the right model for the host's Apple Silicon unified memory tier.
+# Arg $1: host RAM in GB (integer). Sets MODEL_NAME, MODEL_URL, MODEL_ACCURACY,
+# MODEL_ALIAS, _MODEL_LABEL, _CTX_SIZE.
+#
+# Architecture refs (Qwen3 technical report):
+#   35B A3B MoE  — 94 layers, 4 KV heads, head_dim 128 → KV ~18.5 GB @ q8_0/196608
+#   27B dense    — 52 layers, 8 KV heads, head_dim 128 → KV  ~6.5 GB @ q8_0/65536
+#   9B dense     — 36 layers, 8 KV heads, head_dim 128 → KV  ~1.1 GB @ q8_0/16384
+select_model() {
+    local ram_gb="${1:-0}"
+    if [ "$ram_gb" -ge 48 ]; then
+        # ~17.6 GB weights + ~18.5 GB KV + ~6 GB OS ≈ 42 GB on 48 GB Mac
+        MODEL_NAME="Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf"
+        MODEL_URL="https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF/resolve/main/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf"
+        MODEL_ACCURACY="standard"
+        MODEL_MMPROJ="mmproj-qwen3.6-35B-A3B-F16.gguf"
+        MODEL_MMPROJ_URL="https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF/resolve/main/mmproj-F16.gguf"
+        _MODEL_LABEL="Qwen3.6-35B-A3B (~17.6GB) [Apple Silicon >=48GB — standard]"
+        _CTX_SIZE=$CTX_48G
+    elif [ "$ram_gb" -ge 32 ]; then
+        # ~5 GB weights + ~1.1 GB KV + ~6 GB OS ≈ 12 GB on 32 GB Mac
+        MODEL_NAME="Qwen3.5-9B-Q4_K_M.gguf"
+        MODEL_URL="https://huggingface.co/unsloth/Qwen3.5-9B-GGUF/resolve/main/Qwen3.5-9B-Q4_K_M.gguf"
+        MODEL_ACCURACY="lower"
+        MODEL_MMPROJ="mmproj-qwen3.5-9B-F16.gguf"
+        MODEL_MMPROJ_URL="https://huggingface.co/unsloth/Qwen3.5-9B-GGUF/resolve/main/mmproj-F16.gguf"
+        _MODEL_LABEL="Qwen3.5-9B-Q4_K_M (~5GB) [Apple Silicon 32GB]"
+        _CTX_SIZE=$CTX_32G
+    elif [ "$ram_gb" -ge 16 ]; then
+        # ~5 GB weights + ~1.1 GB KV + ~6 GB OS ≈ 12 GB on 16 GB Mac
+        MODEL_NAME="Qwen3.5-9B-Q4_K_M.gguf"
+        MODEL_URL="https://huggingface.co/unsloth/Qwen3.5-9B-GGUF/resolve/main/Qwen3.5-9B-Q4_K_M.gguf"
+        MODEL_ACCURACY="lower"
+        MODEL_MMPROJ="mmproj-qwen3.5-9B-F16.gguf"
+        MODEL_MMPROJ_URL="https://huggingface.co/unsloth/Qwen3.5-9B-GGUF/resolve/main/mmproj-F16.gguf"
+        _MODEL_LABEL="Qwen3.5-9B-Q4_K_M (~5GB) [Apple Silicon 16GB — lower accuracy]"
+        _CTX_SIZE=$CTX_16G
+    else
+        MODEL_NAME="Qwen3.5-9B-Q4_K_M.gguf"
+        MODEL_URL="https://huggingface.co/unsloth/Qwen3.5-9B-GGUF/resolve/main/Qwen3.5-9B-Q4_K_M.gguf"
+        MODEL_ACCURACY="lower"
+        MODEL_MMPROJ=""
+        MODEL_MMPROJ_URL=""
+        _MODEL_LABEL="Qwen3.5-9B-Q4_K_M (~5GB) [Apple Silicon <16GB]"
+        _CTX_SIZE=$CTX_8G
+    fi
+    MODEL_ALIAS="${MODEL_NAME%.gguf}"
+}
+
 # Initialize Homebrew in PATH (installed by install_prereqs_macos.sh)
 # Detect architecture to set correct Homebrew prefix
 ARCH=$(uname -m)
@@ -31,6 +89,14 @@ fi
 if [ -d "$BREW_PREFIX" ]; then
     eval "$("$BREW_PREFIX"/bin/brew shellenv)"
     export PATH="$BREW_PREFIX/bin:$PATH"
+fi
+
+# Intel Macs have no unified memory and no Metal GPU — inference is unsupported.
+if [ "$ARCH" != "arm64" ]; then
+    if [ "${OPENMONO_ROLE:-}" = "full" ] || [ "${OPENMONO_ROLE:-}" = "inference" ]; then
+        die "Full/inference roles require Apple Silicon (arm64). Intel Mac detected.
+Use the 'agent' role on this machine and point it at a separate inference server."
+    fi
 fi
 
 # Role selector — drives which of the install steps actually run.
@@ -46,7 +112,7 @@ esac
 # Step counts vary by role.
 case "$OPENMONO_ROLE" in
     full)      TOTAL_STEPS=8 ;;
-    inference) TOTAL_STEPS=7 ;;
+    inference) TOTAL_STEPS=6 ;;
     agent)     TOTAL_STEPS=5 ;;
 esac
 
@@ -55,7 +121,7 @@ banner "OpenMono.ai Installer (role: $OPENMONO_ROLE) — macOS"
 CURRENT_STEP=0
 next_step() {
     CURRENT_STEP=$((CURRENT_STEP + 1))
-    step $CURRENT_STEP $TOTAL_STEPS "$1"
+    step "$CURRENT_STEP" "$TOTAL_STEPS" "$1"
 }
 
 # ── Prerequisite Check ────────────────────────────────────────────────────────
@@ -64,22 +130,25 @@ check_prerequisites() {
     local missing=()
     local warnings=()
 
-    # Required commands
-    command -v docker &>/dev/null || missing+=("docker")
+    # Required commands (unconditional)
     command -v git &>/dev/null || missing+=("git")
     command -v curl &>/dev/null || missing+=("curl")
-    command -v cmake &>/dev/null || missing+=("cmake")
+    command -v jq &>/dev/null || missing+=("jq")
 
-    # Docker Compose (check hyphenated version on macOS, space-separated on Linux)
-    if ! docker-compose --version &>/dev/null 2>&1 && ! docker compose --version &>/dev/null 2>&1; then
-        missing+=("docker-compose")
-    fi
-
-    # Check if user can run docker
-    if command -v docker &>/dev/null; then
-        if ! docker info &>/dev/null 2>&1; then
+    # Docker/Docker Compose only needed for full and agent roles (not inference)
+    if [ "$OPENMONO_ROLE" != "inference" ]; then
+        command -v docker &>/dev/null || missing+=("docker")
+        if ! docker-compose --version &>/dev/null 2>&1 && ! docker compose --version &>/dev/null 2>&1; then
+            missing+=("docker-compose")
+        fi
+        if command -v docker &>/dev/null && ! docker info &>/dev/null 2>&1; then
             warnings+=("Docker is installed but not accessible. Try: sudo systemctl restart docker (or restart Docker Desktop)")
         fi
+    fi
+
+    # cmake only needed for inference role
+    if [ "$OPENMONO_ROLE" != "agent" ]; then
+        command -v cmake &>/dev/null || missing+=("cmake")
     fi
 
     # .NET SDK (optional but recommended)
@@ -106,7 +175,7 @@ check_prerequisites() {
             printf "  ${YELLOW}⚠${NC}  %s\n" "$w"
         done
         echo ""
-        if ! docker info &>/dev/null 2>&1; then
+        if [ "$OPENMONO_ROLE" != "inference" ] && ! docker info &>/dev/null 2>&1; then
             err "Docker is installed but not accessible."
             die "Please restart Docker Desktop and try again."
         fi
@@ -136,15 +205,28 @@ ok "Install directory: $INSTALL_DIR"
 
 next_step "Checking system requirements"
 
-# RAM — macOS always runs CPU mode (Docker runs in a Linux VM, no GPU passthrough)
-# Only relevant for roles that load a model locally
-if [ "$OPENMONO_ROLE" != "agent" ] && command -v sysctl &>/dev/null; then
+# Detect unified memory and select model for this machine's tier.
+TOTAL_MEM=0
+if command -v sysctl &>/dev/null; then
     TOTAL_MEM=$(( $(sysctl -n hw.memsize 2>/dev/null || echo 0) / 1024 / 1024 / 1024 ))
-    if [ "$TOTAL_MEM" -lt 20 ]; then
-        warn "Only ${TOTAL_MEM}GB RAM detected — CPU model needs ~20GB. It may be slow or fail to load."
-    else
-        ok "RAM: ${TOTAL_MEM}GB"
+fi
+
+if [ "$OPENMONO_ROLE" != "agent" ]; then
+    if [ "$TOTAL_MEM" -lt 16 ]; then
+        die "Only ${TOTAL_MEM}GB RAM detected. 16GB unified memory is the minimum for inference.
+Upgrade to a Mac with at least 16GB, or use the 'agent' role and connect to a separate inference server."
     fi
+    select_model "$TOTAL_MEM"
+
+    # Reduce context when mmproj is active (encoder needs ~1-2 GB burst)
+    if [ -n "${MODEL_MMPROJ:-}" ]; then
+        _CTX_ORIG=$_CTX_SIZE
+        if   [ "$TOTAL_MEM" -ge 48 ]; then _CTX_SIZE=$CTX_VISION
+        elif [ "$TOTAL_MEM" -ge 32 ]; then _CTX_SIZE=$CTX_VISION_32G
+        else                                _CTX_SIZE=$CTX_VISION_16G; fi
+        detail "Vision enabled: context reduced from $((_CTX_ORIG/1024))k → $((_CTX_SIZE/1024))k to fit mmproj"
+    fi
+    ok "Apple Silicon ${TOTAL_MEM}GB → $_MODEL_LABEL (ctx: $_CTX_SIZE)"
 fi
 
 # Detect pip/pip3 for optional python deps (should be available from install_prereqs)
@@ -186,13 +268,12 @@ cd "$INSTALL_DIR"
 # ── Step 4: Download model (inference + full only) ────────────────────────────
 
 if [ "$OPENMONO_ROLE" != "agent" ]; then
-    next_step "Downloading Qwen3.6-35B-A3B model (~18.5 GB)"
+    next_step "Downloading $_MODEL_LABEL"
 
     MODEL_DIR="$INSTALL_DIR/models"
-    MODEL_NAME="qwen3.6-35b-a3b-ud-q4_k_xl.gguf"
     MODEL_FILE="$MODEL_DIR/$MODEL_NAME"
-    MODEL_URL="https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF/resolve/main/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf"
-    MODEL_MIN_BYTES=$((1024 * 1024 * 1024))  # 1 GB sanity check (real file ~18.5 GB)
+    # MODEL_NAME and MODEL_URL set by select_model() in Step 2
+    MODEL_MIN_BYTES=$((1024 * 1024 * 1024))  # 1 GB sanity check
 
     mkdir -p "$MODEL_DIR"
 
@@ -235,6 +316,28 @@ if [ "$OPENMONO_ROLE" != "agent" ]; then
         fi
 
         ok "Model downloaded ($(du -h "$MODEL_FILE" | awk '{print $1}'))"
+    fi
+
+    # ── mmproj (vision projector) ─────────────────────────────────────────────
+    if [ -z "${MODEL_MMPROJ:-}" ]; then
+        info "No mmproj configured for this model — vision disabled"
+    else
+        MMPROJ_FILE="$MODEL_DIR/$MODEL_MMPROJ"
+        MMPROJ_MIN_BYTES=$((100 * 1024 * 1024))
+        if [ -f "$MMPROJ_FILE" ] && [ "$(stat -f%z "$MMPROJ_FILE" 2>/dev/null || echo 0)" -gt "$MMPROJ_MIN_BYTES" ]; then
+            ok "mmproj already present ($(du -h "$MMPROJ_FILE" | awk '{print $1}'))"
+        else
+            [ -f "$MMPROJ_FILE" ] && { warn "Existing mmproj incomplete — removing"; rm -f "$MMPROJ_FILE"; }
+            info "Downloading mmproj: $MODEL_MMPROJ (~900 MB)"
+            if ! run_live curl -L --fail --progress-bar -o "$MMPROJ_FILE" "$MODEL_MMPROJ_URL"; then
+                rm -f "$MMPROJ_FILE"
+                warn "mmproj download failed — vision will be unavailable"
+                MODEL_MMPROJ=""
+                MMPROJ_FILE=""
+            else
+                ok "mmproj downloaded ($(du -h "$MMPROJ_FILE" | awk '{print $1}'))"
+            fi
+        fi
     fi
 fi
 
@@ -304,141 +407,122 @@ if [ "$OPENMONO_ROLE" != "inference" ]; then
     fi
 fi
 
-# ── Step 6: Docker configuration (inference + full only) ──────────────────────
+# ── Step 6: Install llama.cpp (inference + full only) ─────────────────────────
 
 if [ "$OPENMONO_ROLE" != "agent" ]; then
-    next_step "Configuring Docker for inference"
+    next_step "Installing llama.cpp (Metal)"
 
-    ARCH=$(uname -m)
-    if [ "$ARCH" = "arm64" ]; then
-        ok "Apple Silicon (M-series) detected — using CPU mode in Docker"
+    # llama.cpp from Homebrew runs natively on the host, enabling Metal GPU
+    # acceleration on Apple Silicon. The agent Docker container reaches it via
+    # host.docker.internal, which Docker Desktop resolves automatically on macOS.
+    if ! command -v llama-server &>/dev/null; then
+        info "Installing llama.cpp via Homebrew..."
+        run brew install llama.cpp || die "brew install llama.cpp failed"
     else
-        ok "Intel Mac detected — using CPU mode"
+        ok "llama-server already installed: $(command -v llama-server)"
     fi
 
-    # On macOS, Docker runs in a Linux VM — no direct Metal GPU passthrough.
-    # We always use CPU mode, tuned to physical core count.
-    OVERRIDE_FILE="$INSTALL_DIR/docker/docker-compose.override.yml"
-    info "Writing CPU override: $OVERRIDE_FILE"
+    # Write the full inference config to ~/.openmono/settings.json.
+    # This is the single source of truth for all runtime commands (start/stop/status).
+    SETTINGS_FILE="$HOME/.openmono/settings.json"
+    mkdir -p "$(dirname "$SETTINGS_FILE")"
+    [ ! -f "$SETTINGS_FILE" ] && echo '{}' > "$SETTINGS_FILE"
 
-    # Detect physical core count (macOS specific)
-    CPU_THREADS="$(sysctl -n hw.physicalcpu 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 8)"
+    # Generate a new API key for this install (stored in docker/.env — single source of truth)
+    LLAMA_API_KEY="$(openssl rand -hex 24)"
+    ENV_FILE="$INSTALL_DIR/docker/.env"
+    mkdir -p "$(dirname "$ENV_FILE")"
+    if [ ! -f "$ENV_FILE" ]; then
+        touch "$ENV_FILE"
+    fi
+    # Remove existing LLAMA_API_KEY if present, then add the new one
+    grep -v '^LLAMA_API_KEY=' "$ENV_FILE" > /tmp/env.tmp 2>/dev/null || true
+    echo "LLAMA_API_KEY=$LLAMA_API_KEY" >> /tmp/env.tmp
+    mv /tmp/env.tmp "$ENV_FILE"
+    chmod 0600 "$ENV_FILE"
 
-    # Derive model alias (strip .gguf extension)
-    MODEL_ALIAS="${MODEL_NAME%.gguf}"
+    python3 - "$SETTINGS_FILE" \
+        "${LLAMA_PORT:-7474}" \
+        "$MODEL_NAME" \
+        "$MODEL_ALIAS" \
+        "$_CTX_SIZE" \
+        "$INSTALL_DIR" \
+        "$LLAMA_API_KEY" \
+        "${MMPROJ_FILE:-}" <<'PYEOF'
+import json, sys
+path, port, model_name, model_alias, ctx_size, install_dir, api_key, mmproj_path = sys.argv[1:9]
+with open(path) as f:
+    cfg = json.load(f)
+cfg.setdefault("llm", {})["endpoint"] = f"http://host.docker.internal:{port}"
+cfg.setdefault("llm", {})["api_key"] = api_key
+cfg["inference"] = {
+    "mode": "native-metal",
+    "model_name": model_name,
+    "model_alias": model_alias,
+    "ctx_size": int(ctx_size),
+    "port": int(port),
+    "install_dir": install_dir,
+    "mmproj_path": mmproj_path if mmproj_path else ""
+}
+with open(path, "w") as f:
+    json.dump(cfg, f, indent=2)
+PYEOF
+    ok "Inference config written to: $SETTINGS_FILE"
+    detail "  model     : $MODEL_NAME"
+    detail "  ctx_size  : $_CTX_SIZE"
+    detail "  endpoint  : http://host.docker.internal:${LLAMA_PORT:-7474}"
+    detail "  api_key   : [generated, stored in docker/.env]"
 
-    cat > "$OVERRIDE_FILE" <<EOF
-# CPU configuration — macOS (Docker runs in Linux VM, no Metal GPU passthrough)
-services:
-  llama-server:
-    image: ghcr.io/ggml-org/llama.cpp:server-vulkan
-    command: >
-      --model /models/$MODEL_NAME
-      --alias $MODEL_ALIAS
-      --host 0.0.0.0
-      --port 7474
-      --ctx-size 196608
-      --threads $CPU_THREADS
-      --threads-batch $CPU_THREADS
-      --batch-size 2048
-      --ubatch-size 1024
-      --flash-attn on
-      --cache-type-k q8_0
-      --cache-type-v q8_0
-      --parallel 1
-      --jinja
-      --reasoning off
-      --metrics
-      \${LLAMA_API_KEY:+--api-key \${LLAMA_API_KEY}}
-EOF
-    ok "CPU override written (threads: $CPU_THREADS, context: 196608)"
-fi
-
-# ── Step 7: Build Docker images ────────────────────────────────────────────────
-
-next_step "Building Docker images"
-
-cd "$INSTALL_DIR/docker"
-
-# Determine which docker compose command to use (prefer v2 plugin over v1 standalone)
-if docker compose version &>/dev/null 2>&1; then
-    DOCKER_COMPOSE_CMD="docker compose"
-elif command -v docker-compose &>/dev/null; then
-    DOCKER_COMPOSE_CMD="docker-compose"
-else
-    die "No Docker Compose found. Run: openmono setup to install prerequisites."
-fi
-
-info "Stopping any running containers..."
-run $DOCKER_COMPOSE_CMD down || true
-
-# Only build the images this role actually needs.
-if [ "$OPENMONO_ROLE" != "agent" ]; then
-    info "Building llama-server image..."
-    if ! run $DOCKER_COMPOSE_CMD build llama-server; then
-        die "llama-server build failed"
+    # Update docker/.env with model and vision state
+    grep -v -E "^MODEL_MMPROJ=|^OPENMONO_VISION_ENABLED=" "$ENV_FILE" > /tmp/env.tmp 2>/dev/null || true
+    mv /tmp/env.tmp "$ENV_FILE"
+    printf "MODEL_MMPROJ=%s\n" "${MODEL_MMPROJ:-}" >> "$ENV_FILE"
+    if [ -n "${MODEL_MMPROJ:-}" ]; then
+        printf "OPENMONO_VISION_ENABLED=1\n" >> "$ENV_FILE"
+    else
+        printf "OPENMONO_VISION_ENABLED=0\n" >> "$ENV_FILE"
     fi
 fi
+
+# ── Step 7: Build Docker images (skipped for inference) ──────────────────────
 
 if [ "$OPENMONO_ROLE" != "inference" ]; then
+    next_step "Building Docker images"
+
+    cd "$INSTALL_DIR/docker"
+
+    # Determine which docker compose command to use (prefer v2 plugin over v1 standalone)
+    if docker compose version &>/dev/null 2>&1; then
+        DOCKER_COMPOSE_CMD="docker compose"
+    elif command -v docker-compose &>/dev/null; then
+        DOCKER_COMPOSE_CMD="docker-compose"
+    else
+        die "No Docker Compose found. Run: openmono setup to install prerequisites."
+    fi
+
+    info "Stopping any running containers..."
+    run $DOCKER_COMPOSE_CMD down || true
+
     info "Building agent image..."
     if ! run $DOCKER_COMPOSE_CMD build agent; then
         die "agent build failed"
     fi
+
+    ok "Docker images built"
 fi
 
-ok "Docker images built"
-
-# ── Step 8: Start llama-server (inference + full only) ────────────────────────
+# ── Step 8: Start llama-server (inference + full only) ──────────────────────
 
 if [ "$OPENMONO_ROLE" != "agent" ]; then
-    next_step "Starting llama-server"
+    next_step "Starting llama-server (Metal)"
 
-    LLAMA_PORT="${LLAMA_PORT:-7474}"
-
-    port_in_use() {
-        lsof -i ":${1}" &>/dev/null 2>&1
-    }
-
-    if port_in_use "$LLAMA_PORT"; then
-        warn "Port ${LLAMA_PORT} is in use"
-        for try in 8081 8082 8083 8084 8085 9080; do
-            if ! port_in_use "$try"; then
-                LLAMA_PORT="$try"
-                info "Using port $LLAMA_PORT instead"
-                break
-            fi
-        done
-    fi
-
-    export LLAMA_PORT
-
-    info "Starting daemon on port ${LLAMA_PORT}..."
-    if ! run $DOCKER_COMPOSE_CMD up -d llama-server; then
-        die "Failed to start llama-server (check: $DOCKER_COMPOSE_CMD logs llama-server)"
-    fi
-
-    info "Waiting for llama-server to become healthy (model load can take 1-2 min)..."
-    HEALTHY=false
-    for i in $(seq 1 36); do
-        if curl -sf "http://localhost:${LLAMA_PORT}/health" &>/dev/null; then
-            HEALTHY=true
-            break
-        fi
-        sleep 5
-        printf "."
-    done
-    echo ""
-
-    if [ "$HEALTHY" = true ]; then
-        ok "llama-server is healthy on port ${LLAMA_PORT}"
-    else
-        warn "llama-server did not become healthy within 180s."
-        warn "This can be normal on systems with limited RAM (model is ~20 GB)."
-        warn "Check: openmono logs"
-        if [ "$OPENMONO_VERBOSE" != "1" ]; then
-            warn "Re-run with OPENMONO_VERBOSE=1 for detailed output."
-        fi
+    # Use openmono start to launch llama-server via scripts/macos/inference.sh
+    # This ensures consistency between install and runtime startup paths.
+    export LLAMA_PORT="${LLAMA_PORT:-7474}"
+    if ! "$INSTALL_DIR/openmono" start; then
+        warn "llama-server startup did not complete cleanly"
+        warn "Check the log: openmono logs"
+        warn "Or restart manually: openmono start"
     fi
 fi
 
@@ -466,11 +550,19 @@ echo ""
 case "$OPENMONO_ROLE" in
     full)
         echo "  llama-server port : ${LLAMA_PORT:-7474}"
-        echo "  mode              : CPU (Docker runs in Linux VM)"
+        echo "  mode              : Metal GPU (native llama.cpp)"
+        echo "  model             : ${MODEL_NAME:-}"
+        if [ -n "${MODEL_MMPROJ:-}" ]; then
+            echo "  vision            : enabled (${MODEL_MMPROJ})"
+        fi
         ;;
     inference)
         echo "  llama-server port : ${LLAMA_PORT:-7474}"
-        echo "  mode              : CPU (Docker runs in Linux VM)"
+        echo "  mode              : Metal GPU (native llama.cpp)"
+        echo "  model             : ${MODEL_NAME:-}"
+        if [ -n "${MODEL_MMPROJ:-}" ]; then
+            echo "  vision            : enabled (${MODEL_MMPROJ})"
+        fi
         ;;
     agent)
         echo "  role              : Agent only (dual-box mode)"
@@ -478,6 +570,23 @@ case "$OPENMONO_ROLE" in
 esac
 echo ""
 show_log_location
+
+# Vision usage info (if enabled)
+if [ "${OPENMONO_ROLE}" != "agent" ] && [ -n "${MODEL_MMPROJ:-}" ]; then
+    echo ""
+    printf "${BOLD}${CYAN}Vision (LLaVA) — Enabled${NC}\n"
+    printf "  ${DIM}Vision encoder (mmproj) loaded with the model (~1-2 GB unified memory)${NC}\n"
+    printf "  ${DIM}Context: reduced $((_CTX_ORIG/1024))k → $((_CTX_SIZE/1024))k to fit encoder burst${NC}\n"
+    printf "\n"
+    printf "  ${DIM}Usage: type @image.png or @screenshot.png in chat${NC}\n"
+    printf "  ${DIM}  Examples:${NC}\n"
+    printf "     @screenshot.png what's on my screen?\n"
+    printf "     @diagram.png explain this diagram\n"
+    printf "\n"
+    printf "  ${DIM}To disable: delete the mmproj file and re-run openmono setup${NC}\n"
+    printf "     rm ~/openmono.ai/models/${MODEL_MMPROJ}${NC}\n"
+    echo ""
+fi
 
 # ── Done ──────────────────────────────────────────────────────────────────────
 # The shell restart and docker group activation is handled by openmono cmd_setup
@@ -489,7 +598,8 @@ if [[ -n "${OPENMONO_ENV_FILE:-}" ]]; then
 export INSTALL_DIR="$INSTALL_DIR"
 export LLAMA_PORT="${LLAMA_PORT:-7474}"
 export OPENMONO_ROLE="$OPENMONO_ROLE"
-export MODEL_ACCURACY="standard"
+export MODEL_NAME="${MODEL_NAME:-}"
+export MODEL_ACCURACY="${MODEL_ACCURACY:-standard}"
 ENVEOF
     _log "Wrote install environment to: $OPENMONO_ENV_FILE"
 else

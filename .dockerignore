@@ -12,10 +12,15 @@ ref/
 # llama.cpp build artifacts (source is copied for Dockerfile.llama)
 llama.cpp/build/
 
+# Test project — not needed in either Dockerfile (legacy or ACP).
+# Reduces the build context from ~10MB to ~2MB.
+src/OpenMono.Tests/
+
 # IDE and OS
 .git/
 .vs/
 .vscode/
+.idea/
 *.swp
 *Zone.Identifier
 
@@ -23,3 +28,7 @@ llama.cpp/build/
 docs/
 *.md
 !OPENMONO.md
+
+# Avoid recursive copy of our own Dockerfile / dockerignore into the image
+Dockerfile
+.dockerignore

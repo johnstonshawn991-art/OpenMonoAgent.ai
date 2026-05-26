@@ -155,15 +155,29 @@ Local llama.cpp is the default and fully supported. OpenAI, Anthropic, and Ollam
 
 </td>
 </tr>
-</table>
+<tr>
+<td valign="top">
 
-> **09 · Distributed inference** — Agent on your laptop, inference on a separate GPU machine. Free relay at [app.openmonoagent.ai](https://app.openmonoagent.ai).
+**09 · Distributed inference**  
+Agent on your laptop, inference on a separate GPU machine. No port forwarding — tunnel is established outbound from the inference box. Free relay at [app.openmonoagent.ai](https://app.openmonoagent.ai).
+
+→ [Dual-box setup guide](docs/SETUP.md#dual-box-setup)
+
+</td>
+<td valign="top">
+
+**10 · Vision**  
+Attach images in chat with `@screenshot.png` or ask the agent to read any image file. The multimodal projector (mmproj) is downloaded automatically at setup. Supported formats: PNG, JPG, GIF, WebP. Large images are auto-resized to fit within VRAM budget. Enable with `OPENMONO_VISION_ENABLED=1`.
+
+→ [Vision setup & usage](docs/SETUP.md#vision)
+
+</td>
+</tr>
+</table>
 
 <div align="center">
   <img src="docs/assets/dual-box-server.png" alt="Distributed inference: agent on laptop, inference on GPU machine" width="680" />
 </div>
-
-→ [Dual-box setup guide](docs/SETUP.md#dual-box-setup) — tunnel setup, relay connection, troubleshooting
 
 ---
 

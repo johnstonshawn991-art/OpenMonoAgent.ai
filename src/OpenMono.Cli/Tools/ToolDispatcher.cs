@@ -21,6 +21,7 @@ public sealed class ToolDispatcher : IDisposable
     private readonly CursorStore _cursorStore;
     private readonly ToolResultCache _cache;
     private readonly ArtifactStore _artifactStore;
+    private readonly IToolExecutor _executor;
 
     private readonly DoomLoopDetector _doomLoop = new();
 
@@ -34,7 +35,8 @@ public sealed class ToolDispatcher : IDisposable
         TurnJournal? journal = null,
         CursorStore? cursorStore = null,
         ToolResultCache? cache = null,
-        ArtifactStore? artifactStore = null)
+        ArtifactStore? artifactStore = null,
+        IToolExecutor? executor = null)
     {
         _tools = tools;
         _permissions = permissions;
@@ -46,6 +48,8 @@ public sealed class ToolDispatcher : IDisposable
         _cursorStore = cursorStore ?? new CursorStore();
         _cache = cache ?? new ToolResultCache();
         _artifactStore = artifactStore ?? ArtifactStore.ForSession(session, config.DataDirectory);
+        _executor = executor ?? new LocalToolExecutor(
+            _journal, _renderer, _config, _session, _permissions, _cache, _artifactStore, _hookRunner);
     }
 
     public CursorStore Cursors => _cursorStore;
@@ -98,7 +102,7 @@ public sealed class ToolDispatcher : IDisposable
             {
                 try
                 {
-                    results[item.Index] = await ExecuteSingleToolAsync(item.Call, item.Tool, context, ct);
+                    results[item.Index] = await _executor.ExecuteAsync(item.Call, item.Tool, context, ct);
                 }
                 catch (Exception ex)
                 {
@@ -112,7 +116,7 @@ public sealed class ToolDispatcher : IDisposable
         {
             try
             {
-                results[item.Index] = await ExecuteSingleToolAsync(item.Call, item.Tool, context, ct);
+                results[item.Index] = await _executor.ExecuteAsync(item.Call, item.Tool, context, ct);
             }
             catch (Exception ex)
             {
@@ -121,171 +125,6 @@ public sealed class ToolDispatcher : IDisposable
         }
 
         return results;
-    }
-
-    public async Task<ToolResult> ExecuteSingleToolAsync(
-        ToolCall call,
-        ITool tool,
-        ToolContext context,
-        CancellationToken ct)
-    {
-
-        _journal.RecordToolCallReceived(call.Id, call.Name, call.Arguments);
-
-        JsonElement input;
-        try
-        {
-            input = JsonDocument.Parse(call.Arguments).RootElement;
-        }
-        catch (JsonException ex)
-        {
-            _journal.RecordSchemaRejected(call.Id, $"json_parse: {ex.Message}");
-            return ToolResult.Error(
-                $"Invalid JSON arguments for {call.Name}: {ex.Message}\nRaw: {call.Arguments[..Math.Min(200, call.Arguments.Length)]}");
-        }
-
-        var validationError = SchemaValidator.Validate(tool.Name, tool.InputSchema, input);
-        if (validationError is not null)
-        {
-            _journal.RecordSchemaRejected(call.Id, validationError);
-            _renderer.WriteToolDenied(call.Name, validationError);
-            Log.Warn($"Tool schema rejected: {call.Name} — {validationError}");
-            return ToolResult.Error(validationError);
-        }
-        _journal.RecordSchemaValidated(call.Id);
-
-        var sanityError = SanityCheck.Check(call.Name, input, _config.WorkingDirectory);
-        if (sanityError is not null)
-        {
-            _journal.RecordSanityRejected(call.Id, sanityError);
-            _renderer.WriteToolDenied(call.Name, sanityError);
-            Log.Warn($"Tool sanity-rejected: {call.Name} — {sanityError}");
-            return ToolResult.Error(sanityError);
-        }
-        _journal.RecordSanityChecked(call.Id);
-
-        if (_session.Meta.PlanMode && !tool.IsReadOnly)
-        {
-            var planModeError = $"Plan mode is active — investigate and write a plan, do not edit files." +
-                                $"Call ExitPlanMode with your completed plan to resume, then retry {call.Name}.";
-            _journal.RecordPermissionDecided(call.Id, false, "plan_mode_active");
-            _renderer.WriteToolDenied(call.Name, planModeError);
-            return ToolResult.Error(planModeError);
-        }
-
-        var capabilities = tool.RequiredCapabilities(input);
-        bool allowed;
-        string? reason;
-
-        if (capabilities.Count > 0)
-        {
-            var capDecision = await _permissions.CheckCapabilitiesAsync(tool.Name, capabilities, ct);
-            allowed = capDecision.Allowed;
-            reason = capDecision.Reason;
-        }
-        else
-        {
-            var permLevel = tool.RequiredPermission(input);
-            var legacyDecision = await _permissions.CheckAsync(tool.Name, input, permLevel, ct);
-            allowed = legacyDecision.Allowed;
-            reason = legacyDecision.Reason;
-        }
-
-        if (!allowed)
-        {
-            _journal.RecordPermissionDecided(call.Id, false, reason);
-            _renderer.WriteToolDenied(call.Name, reason ?? "Permission denied");
-            Log.Info($"Tool denied: {call.Name} — {reason ?? "User denied"}");
-            return ToolResult.Error(
-                $"Permission denied for {call.Name}: {reason ?? "User denied"}. " +
-                $"Do not retry this tool call. Ask the user how to proceed instead.");
-        }
-        _journal.RecordPermissionDecided(call.Id, true);
-
-        if (tool.IsReadOnly && _cache.TryGet(call.Name, input, out var cachedResult) && cachedResult is not null)
-        {
-            _journal.RecordToolStarted(call.Id);
-            _journal.RecordToolCompleted(call.Id, cachedResult.Class, cachedResult.Artifacts.Select(a => a.Id).ToList());
-            _renderer.WriteToolStart(call.Name, call.Arguments);
-            _renderer.WriteToolSuccess(call.Name);
-            Log.Debug($"Tool cache hit: {call.Name}");
-            return cachedResult with { ModelPreview = $"[cached] {cachedResult.ModelPreview}" };
-        }
-
-        _renderer.WriteToolStart(call.Name, call.Arguments);
-
-        _session.Meta.TokenTracker?.RecordToolUse(call.Name);
-
-        _journal.RecordToolStarted(call.Id);
-
-        try
-        {
-            await _hookRunner.RunPreToolUseHooksAsync(call.Name, call.Arguments, ct);
-
-            Log.Debug($"Tool executing: {call.Name}");
-            var result = await tool.ExecuteAsync(input, context, ct);
-
-            await _hookRunner.RunPostToolUseHooksAsync(call.Name, result.Content, ct);
-
-            if (result.Class == ResultClass.Success && result.ModelPreview.Length > _artifactStore.LargeOutputThreshold)
-            {
-                result = _artifactStore.PersistAndReplace(result, call.Name);
-                Log.Debug($"Tool output persisted as artifact: {call.Name}");
-            }
-
-            if (tool.IsReadOnly && result.Class == ResultClass.Success)
-            {
-                _cache.Put(call.Name, input, result);
-            }
-
-            if (!tool.IsReadOnly && call.Name is "FileWrite" or "FileEdit" or "ApplyPatch")
-            {
-                if (input.TryGetProperty("file_path", out var pathEl) && pathEl.GetString() is { } filePath)
-                {
-                    var resolvedPath = Path.GetFullPath(filePath, _config.WorkingDirectory);
-                    _cache.InvalidatePath(resolvedPath);
-                    FileReadTool.InvalidateCache(resolvedPath);
-                }
-            }
-
-            var artifactIds = result.Artifacts.Select(a => a.Id).ToList();
-            _journal.RecordToolCompleted(call.Id, result.Class, artifactIds);
-
-            if (result.IsError)
-            {
-                _renderer.WriteToolError(call.Name, result.ErrorMessage ?? "Unknown error");
-                Log.Warn($"Tool error: {call.Name} — {result.ErrorMessage}");
-            }
-            else
-            {
-                _renderer.WriteToolSuccess(call.Name);
-
-                if (call.Name is "FileRead" or "FileWrite" &&
-                    input.TryGetProperty("file_path", out var fpProp) &&
-                    fpProp.GetString() is { } filePath)
-                {
-                    var content = call.Name == "FileWrite"
-                        ? (input.TryGetProperty("content", out var cp) ? cp.GetString() ?? "" : "")
-                        : result.ModelPreview;
-                    _renderer.WriteToolContent(call.Name, filePath, content);
-                }
-            }
-
-            return result;
-        }
-        catch (OperationCanceledException)
-        {
-            _journal.RecordToolCrashed(call.Id, "OperationCanceledException", "cancelled");
-            Log.Info($"Tool cancelled: {call.Name}");
-            return ToolResult.Cancelled($"{call.Name} was cancelled");
-        }
-        catch (Exception ex)
-        {
-            _journal.RecordToolCrashed(call.Id, ex.GetType().Name, ex.Message);
-            _renderer.WriteToolError(call.Name, ex.Message);
-            Log.Error($"Tool exception: {call.Name}", ex);
-            return ToolResult.Crash($"Tool execution failed: {ex.Message}", "Try with different parameters or report this as a bug.");
-        }
     }
 
     public ToolContext BuildToolContext() => new()

@@ -20,4 +20,5 @@ public sealed class ToolContext
     public Action? BeginResponse { get; init; }
     public Action? EndResponse { get; init; }
     public Action<string>? StreamText { get; init; }
+    public Action<string>? OnDebug { get; init; }
 }

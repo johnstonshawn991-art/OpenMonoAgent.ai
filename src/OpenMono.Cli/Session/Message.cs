@@ -15,6 +15,7 @@ public sealed record Message
 {
     public required MessageRole Role { get; init; }
     public string? Content { get; init; }
+    public IReadOnlyList<ContentPart>? ContentParts { get; init; }
     public List<ToolCall>? ToolCalls { get; init; }
     public string? ToolCallId { get; init; }
     public string? ToolName { get; init; }
@@ -27,3 +28,7 @@ public sealed record ToolCall
     public required string Name { get; init; }
     public required string Arguments { get; init; }
 }
+
+public abstract record ContentPart;
+public sealed record TextPart(string Text) : ContentPart;
+public sealed record ImagePart(string Url) : ContentPart;

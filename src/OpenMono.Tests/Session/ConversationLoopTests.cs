@@ -115,9 +115,9 @@ public class ConversationLoopTests
         ];
 
         var llm = new FakeLlmClient(
-            ToolRound("t1"), TextRound(),   // turn 1
-            ToolRound("t2"), TextRound(),   // turn 2
-            ToolRound("t3"), TextRound()    // turn 3 — new prompt after /checkpoint
+            ToolRound("t1"), TextRound(),
+            ToolRound("t2"), TextRound(),
+            ToolRound("t3"), TextRound()
         );
 
         var tools = new ToolRegistry();
@@ -131,7 +131,7 @@ public class ConversationLoopTests
 
         await loop.RunTurnAsync("Turn 1", CancellationToken.None);
         await loop.RunTurnAsync("Turn 2", CancellationToken.None);
-        // /checkpoint would run here in real usage — it cannot clear _recentToolSignatures (the bug)
+
         await loop.RunTurnAsync("Completely different prompt after checkpoint", CancellationToken.None);
 
         session.Messages
@@ -148,7 +148,7 @@ public class ConversationLoopTests
             new() { IsComplete = true },
         ];
 
-        // ABAB — model oscillates between two tools, never making progress
+
         var llm = new FakeLlmClient(
             Round("ToolA"), Round("ToolB"),
             Round("ToolA"), Round("ToolB")

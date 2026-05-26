@@ -3,6 +3,7 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using OpenMono.Permissions;
+using OpenMono.Session;
 using OpenMono.Utils;
 
 namespace OpenMono.Tools;
@@ -11,6 +12,7 @@ public sealed class FileReadTool : ToolBase
 {
     public override string Name => "FileRead";
     public override string Description => "Read a file from the filesystem. Returns the contents with line numbers. " +
+        "For image files (png, jpg, jpeg, gif, webp), attaches the image directly so you can view and describe it. " +
         "Can also read multiple files from a cursor (e.g., from Grep results).";
     public override bool IsConcurrencySafe => true;
     public override bool IsReadOnly => true;
@@ -64,6 +66,24 @@ public sealed class FileReadTool : ToolBase
 
         if (!File.Exists(resolvedPath))
             return ToolResult.Error($"File not found: {resolvedPath}");
+
+        var ext = Path.GetExtension(resolvedPath).TrimStart('.').ToLowerInvariant();
+        if (ImageUtils.Extensions.Contains(ext))
+        {
+            try
+            {
+                var raw = await File.ReadAllBytesAsync(resolvedPath, ct);
+                var (bytes, mime) = ImageUtils.SmartResize(raw, ImageUtils.MimeFromExt(ext));
+                var b64 = Convert.ToBase64String(bytes);
+                var info = new FileInfo(resolvedPath);
+                return ToolResult.Success($"[Image: {Path.GetFileName(resolvedPath)} ({info.Length / 1024}KB)]")
+                    .WithImages([new ImagePart($"data:{mime};base64,{b64}")]);
+            }
+            catch (Exception ex)
+            {
+                return ToolResult.Error($"Error reading image: {ex.Message}");
+            }
+        }
 
         try
         {
