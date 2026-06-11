@@ -1,0 +1,13 @@
+BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//Michael Angstadt//biweekly 0.6.8//EN
+BEGIN:VEVENT
+UID:b6a6422f-8133-4c66-8121-fdf68ec5b8bf
+DTSTAMP:20260528T025355Z
+DESCRIPTION:Statement Balance Due: 45.94\nMinimum Payment Due: 45.94\nPayme
+ nt Due Date: June 16\, 2026\n
+SUMMARY:Triangle Mastercard eStatement Payment Due Date
+ORGANIZER:mailto:Canadian Tire
+DTSTART;VALUE=DATE:20260616
+END:VEVENT
+END:VCALENDAR
