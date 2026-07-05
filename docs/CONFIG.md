@@ -122,21 +122,11 @@ By default these write to the project-level `.openmono/settings.json`. Pass `--g
     "presence_penalty": 1.5
   },
   "providers": {
-    "anthropic": {
-      "api_key": "sk-ant-...",
-      "model": "claude-opus-4-7",
-      "active": false
-    },
-    "openai": {
-      "api_key": "sk-...",
-      "model": "gpt-4o",
-      "active": false
-    },
-    "ollama": {
-      "endpoint": "http://localhost:11434",
-      "model": "llama3",
-      "active": false
-    }
+    "anthropic": { "api_key": "sk-ant-...", "model": "claude-opus-4-7", "active": false },
+    "openai":    { "api_key": "sk-...",     "model": "gpt-4o",           "active": false },
+    "ollama":    { "endpoint": "http://localhost:11434", "model": "llama3", "active": false },
+    "openrouter": { "api_key": "sk-or-...", "model": "openrouter/fusion", "active": false },
+    "sakana":    { "api_key": "sk-sakana-...", "model": "fugu", "active": false }
   },
   "permissions": {
     "tools": {
@@ -216,7 +206,9 @@ Named provider configurations. Set `"active": true` on one to use it as the acti
 "providers": {
   "anthropic": { "api_key": "sk-ant-...", "model": "claude-opus-4-7", "active": true },
   "openai":    { "api_key": "sk-...",     "model": "gpt-4o",           "active": false },
-  "ollama":    { "endpoint": "http://localhost:11434", "model": "llama3", "active": false }
+  "ollama":    { "endpoint": "http://localhost:11434", "model": "llama3", "active": false },
+  "openrouter": { "api_key": "sk-or-...", "model": "openrouter/fusion", "active": false },
+  "sakana":    { "api_key": "sk-sakana-...", "model": "fugu", "active": false }
 }
 ```
 

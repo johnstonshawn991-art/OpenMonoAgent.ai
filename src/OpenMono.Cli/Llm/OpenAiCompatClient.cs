@@ -33,6 +33,7 @@ public sealed class OpenAiCompatClient : ILlmClient, IDisposable
         RegexOptions.Singleline | RegexOptions.Compiled);
 
     public string? ApiKey { get; init; }
+    public IReadOnlyDictionary<string, string>? ExtraHeaders { get; init; }
     public Action<string>? OnDebug { get; set; }
 
     private readonly string _model;
@@ -114,6 +115,12 @@ public sealed class OpenAiCompatClient : ILlmClient, IDisposable
 
             if (ApiKey is not null)
                 request.Headers.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", ApiKey);
+
+            if (ExtraHeaders is not null)
+            {
+                foreach (var (name, value) in ExtraHeaders)
+                    request.Headers.TryAddWithoutValidation(name, value);
+            }
 
             try
             {

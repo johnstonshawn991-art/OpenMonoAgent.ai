@@ -185,12 +185,21 @@ For a single-user setup (typical), keep `--parallel 1` to maximise context. To a
 
 ## Using cloud models instead
 
-> [!CAUTION]
-> Cloud providers (OpenAI, Anthropic, Ollama) are WIP and untested. Local llama.cpp is the only fully supported provider.
+OpenMono is a **standalone agent** (not a Cursor plugin). It runs from the `openmono` CLI or via the optional VS Code/Cursor ACP extension — the agent logic always lives in this repo.
 
-If you prefer a cloud model for a session, switch without restarting:
+For orchestration backends that fan out to multiple frontier models, two first-class providers are built in:
+
+| Provider | Model slug | What it does |
+|----------|------------|--------------|
+| `openrouter` | `openrouter/fusion` | [OpenRouter Fusion](https://openrouter.ai/docs/guides/features/plugins/fusion) — panel of models + judge synthesis |
+| `sakana` | `fugu` / `fugu-ultra-20260615` | [Sakana Fugu](https://sakana.ai/fugu/) — learned multi-agent orchestrator as one API |
+
+Switch without restarting:
 
 ```bash
+/model openrouter/fusion          # OpenRouter Fusion (requires OPENROUTER_API_KEY)
+/model fugu                         # Sakana Fugu (requires SAKANA_API_KEY)
+/model fugu-ultra-20260615          # Sakana Fugu Ultra — max quality, higher latency
 /model claude-sonnet-4-20250514   # Anthropic (requires ANTHROPIC_API_KEY)
 /model gpt-4o                     # OpenAI (requires OPENAI_API_KEY)
 ```
@@ -200,12 +209,26 @@ Or set permanently in `settings.json`:
 ```jsonc
 {
   "providers": {
-    "anthropic": { "api_key": "sk-ant-...", "model": "claude-sonnet-4-20250514", "active": true }
+    "openrouter": {
+      "api_key": "sk-or-...",
+      "model": "openrouter/fusion",
+      "active": true
+    },
+    "sakana": {
+      "api_key": "sk-sakana-...",
+      "model": "fugu",
+      "active": false
+    }
   }
 }
 ```
 
-The local llama-server keeps running in the background — switch back to it any time with `/model qwen3.6-27b`.
+Environment variables: `OPENROUTER_API_KEY`, `SAKANA_API_KEY`, `OPENMONO_PROVIDER=openrouter`.
+
+> [!CAUTION]
+> Cloud providers are newer than local llama.cpp. Local inference remains the default and most tested path. Fusion and Fugu calls are billed per underlying model invocation and may take 2–3× longer than a single-model request.
+
+The local llama-server keeps running in the background — switch back any time with `/model qwen3.6-27b`.
 
 ---
 
