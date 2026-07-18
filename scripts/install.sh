@@ -521,6 +521,7 @@ services:
       --jinja
       --reasoning off
       --metrics ${MMPROJ_OPT}
+      \${LLAMA_API_KEY:+--api-key \${LLAMA_API_KEY}}
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility

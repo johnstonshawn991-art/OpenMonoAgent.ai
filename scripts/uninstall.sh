@@ -160,9 +160,16 @@ rm_path() {
         fi
         if rm -rf "$target" 2>>"$OPENMONO_LOG_FILE"; then
             ok "Removed $label"
-        else
-            warn "Could not remove $label (permission denied?)"
+            return 0
         fi
+        if [ -n "${SUDO:-}" ]; then
+            detail "$label not fully removable as $(id -un 2>/dev/null || echo "$USER") — retrying with $SUDO (container-owned files?)"
+            if $SUDO rm -rf "$target" 2>>"$OPENMONO_LOG_FILE"; then
+                ok "Removed $label (with $SUDO)"
+                return 0
+            fi
+        fi
+        warn "Could not remove $label (permission denied?)"
     else
         detail "$label not present — skipping"
     fi

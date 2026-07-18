@@ -32,6 +32,8 @@ public sealed class AnsiTuiRenderer : IRenderer
 
     public void AddUserMessage(string text) => _painter.AddUserMessage(text);
 
+    public char ReadMenuKey(params char[] allowed) => _inputReader.ReadMenuKey(allowed);
+
     public void OnTokensUpdated() => _painter.OnTokensUpdated();
 
     public string? DequeueMessage() => _painter.DequeueMessage();
@@ -46,7 +48,7 @@ public sealed class AnsiTuiRenderer : IRenderer
     public void EnterFullScreen()
     {
         _painter.Sz();
-        _painter.Write($"{AnsiPainter.E}[?1049h{AnsiPainter.E}[?1000h{AnsiPainter.E}[?1006h{AnsiPainter.E}[?25l{AnsiPainter.E}[2J");
+        _painter.Write($"{AnsiPainter.E}[?1049h{AnsiPainter.E}[?1002h{AnsiPainter.E}[?1006h{AnsiPainter.E}[?25l{AnsiPainter.E}[2J");
         AnsiPainter.Flush();
         _inFullScreen = true;
         _painter.InvalidateCache();
@@ -57,7 +59,7 @@ public sealed class AnsiTuiRenderer : IRenderer
     {
         if (!_inFullScreen) return;
         _inFullScreen = false;
-        _terminal.WriteAsync($"{AnsiPainter.E}[?1000l{AnsiPainter.E}[?1006l{AnsiPainter.E}[?25h{AnsiPainter.E}[?1049l{AnsiPainter.R}").GetAwaiter().GetResult();
+        _terminal.WriteAsync($"{AnsiPainter.E}[?1000l{AnsiPainter.E}[?1002l{AnsiPainter.E}[?1006l{AnsiPainter.E}[?25h{AnsiPainter.E}[?1049l{AnsiPainter.R}").GetAwaiter().GetResult();
         Console.Out.Flush();
         try { Console.TreatControlCAsInput = false; } catch { }
     }
@@ -69,7 +71,7 @@ public sealed class AnsiTuiRenderer : IRenderer
         _painter.StopPaintThread();
         try
         {
-            _terminal.WriteAsync($"{AnsiPainter.E}[?1000l{AnsiPainter.E}[?1006l{AnsiPainter.E}[?25h{AnsiPainter.E}[?1049l{AnsiPainter.R}\n").GetAwaiter().GetResult();
+            _terminal.WriteAsync($"{AnsiPainter.E}[?1000l{AnsiPainter.E}[?1002l{AnsiPainter.E}[?1006l{AnsiPainter.E}[?25h{AnsiPainter.E}[?1049l{AnsiPainter.R}\n").GetAwaiter().GetResult();
             Console.Out.Flush();
             try { Console.TreatControlCAsInput = false; } catch { }
         }
@@ -93,6 +95,8 @@ public sealed class AnsiTuiRenderer : IRenderer
     public void ShowWaitingIndicator(string? label, string? agentLabel) => _painter.ShowWaitingIndicator(label, agentLabel);
     public void ClearWaitingIndicator()     => _painter.ClearWaitingIndicator(null);
     public void ClearWaitingIndicator(string? agentLabel) => _painter.ClearWaitingIndicator(agentLabel);
+    public void ShowToolProgress(string label) => _painter.ShowToolProgress(label);
+    public void ClearToolProgress()            => _painter.ClearToolProgress();
 
     private static readonly HashSet<string> _silentTools =
         ["Glob", "FileRead", "FileWrite", "ListDirectory", "ToolSearch", "Grep"];

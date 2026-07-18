@@ -1,8 +1,10 @@
 using System.Text.Json;
 using System.Text.RegularExpressions;
+using OpenMono.Acp;
 using OpenMono.Config;
 using OpenMono.Rendering;
 using OpenMono.Tools;
+using OpenMono.Utils;
 
 namespace OpenMono.Permissions;
 
@@ -82,11 +84,6 @@ public sealed class PermissionEngine
         if (capabilities.Count == 0)
             return new(true, null, capabilities);
 
-        if (IsPreApprovedByPlaybookScope(toolName))
-            return new(true, null, capabilities);
-
-        if (_sessionAllowAll.Contains(toolName))
-            return new(true, null, capabilities);
         if (_sessionDenyAll.Contains(toolName))
             return new(false,
                 $"{toolName} was denied for this session by the user. " +
@@ -106,6 +103,12 @@ public sealed class PermissionEngine
             if (denyReason is not null)
                 return new(false, denyReason, capabilities);
         }
+
+        if (IsPreApprovedByPlaybookScope(toolName))
+            return new(true, null, capabilities);
+
+        if (_sessionAllowAll.Contains(toolName))
+            return new(true, null, capabilities);
 
         var uncoveredCaps = new List<Capability>();
         foreach (var cap in capabilities)
@@ -139,11 +142,7 @@ public sealed class PermissionEngine
             var inputStr = input.ToString();
 
             if (rules.Deny.Any(pattern => MatchesPattern(inputStr, pattern)))
-            {
-                if (TrackDenial())
-                    return await PromptUserAsync(toolName, input, ct);
                 return new(false, $"Denied by permission rule for {toolName}");
-            }
         }
 
         if (IsPreApprovedByPlaybookScope(toolName))
@@ -158,15 +157,11 @@ public sealed class PermissionEngine
             return new(true);
         }
         if (_sessionDenyAll.Contains(toolName))
-        {
-            if (TrackDenial())
-                return await PromptUserAsync(toolName, input, ct);
             return new(false,
                 $"{toolName} was denied for this session by the user. " +
                 "This is an app-level block — NOT a file system permission issue. " +
                 "Tell the user to start a new session and allow the tool when prompted. " +
                 "Do NOT suggest chmod, chown, attrib, or any OS permission commands.");
-        }
 
         if (level == PermissionLevel.AutoAllow)
         {
@@ -175,11 +170,7 @@ public sealed class PermissionEngine
         }
 
         if (level == PermissionLevel.Deny)
-        {
-            if (TrackDenial())
-                return await PromptUserAsync(toolName, input, ct);
             return new(false, "Tool is not permitted");
-        }
 
         if (rules is not null)
         {
@@ -195,6 +186,24 @@ public sealed class PermissionEngine
         var prompted = await PromptUserAsync(toolName, input, ct);
         if (prompted.Allowed) TrackAllow(); else TrackDenial();
         return prompted;
+    }
+
+    /// <summary>
+    /// Pauses execution and waits for user response to a permission request.
+    /// Logs "Awaiting user response" and throws PendingUserResponseException to pause the agent.
+    /// </summary>
+    public async Task<(bool Approved, string Scope)> PauseForUserResponseAsync(
+        IAcpUserInteraction? userInteraction,
+        string toolName,
+        string summary,
+        bool dangerous,
+        CancellationToken ct)
+    {
+        if (userInteraction is null)
+            throw new InvalidOperationException("User interaction is not available for permission request");
+
+        Utils.Log.Info($"Awaiting user response for {toolName}");
+        return await userInteraction.RequestPermissionAsync(toolName, summary, dangerous, ct);
     }
 
     private string? CheckCapabilityDenyRules(Capability cap)
@@ -233,7 +242,7 @@ public sealed class PermissionEngine
     private bool IsAutoAllowedCapability(Capability cap) => cap switch
     {
 
-        FileReadCap fr when fr.Path.StartsWith(_config.WorkingDirectory) => true,
+        FileReadCap fr when IsReadAutoAllowed(fr.Path) => true,
 
         MemoryCap mc when mc.Operation == "read" => true,
 
@@ -241,6 +250,15 @@ public sealed class PermissionEngine
 
         _ => false
     };
+
+    private bool IsReadAutoAllowed(string path)
+    {
+        var full = Path.IsPathRooted(path)
+            ? Path.GetFullPath(path)
+            : Path.GetFullPath(Path.Combine(_config.WorkingDirectory, path));
+
+        return PathGuard.Validate(full, _config.WorkingDirectory) is null;
+    }
 
     private static bool IsSafeReadOnlyCommand(ProcessExecCap cap)
     {
@@ -306,15 +324,16 @@ public sealed class PermissionEngine
                 "Allow this capability in the main session first, then re-run the sub-agent.",
                 allCaps);
 
-        if (uncoveredCaps.Count == 1)
+        if (uncoveredCaps.Count == 1 && uncoveredCaps[0].HasCustomPrompt)
         {
             var approved = await uncoveredCaps[0].PromptUserAsync(_input, toolName, ct);
             return approved ? new(true, null, allCaps) : new(false, PermissionDeniedOnce, allCaps);
         }
 
-        // Multiple capabilities: use generic batch prompt
-        var summary = $"{toolName} requires:\n" +
-                      string.Join("\n", uncoveredCaps.Select(c => $"  - {c.Summary}"));
+        var summary = uncoveredCaps.Count == 1
+            ? uncoveredCaps[0].Summary
+            : $"{toolName} requires:\n" +
+              string.Join("\n", uncoveredCaps.Select(c => $"  - {c.Summary}"));
 
         var response = await _input.AskPermissionAsync(toolName, summary, ct);
 
@@ -331,15 +350,20 @@ public sealed class PermissionEngine
     private CapabilityDecision AllowAllCapabilitiesForSession(
         string toolName, List<Capability> caps, IReadOnlyList<Capability> allCaps)
     {
+        _sessionDenyAll.Remove(toolName);
         _sessionAllowAll.Add(toolName);
 
         foreach (var cap in caps)
+        {
+            _sessionDenyCapTypes.Remove(cap.GetType().Name);
             _sessionAllowCapTypes.Add(cap.GetType().Name);
+        }
         return new(true, null, allCaps);
     }
 
     private CapabilityDecision DenyAllCapabilitiesForSession(string toolName, IReadOnlyList<Capability> allCaps)
     {
+        _sessionAllowAll.Remove(toolName);
         _sessionDenyAll.Add(toolName);
         return new(false, PermissionDeniedSession, allCaps);
     }
@@ -367,12 +391,14 @@ public sealed class PermissionEngine
 
     private PermissionDecision AllowAllForSession(string toolName)
     {
+        _sessionDenyAll.Remove(toolName);
         _sessionAllowAll.Add(toolName);
         return new(true);
     }
 
     private PermissionDecision DenyAllForSession(string toolName)
     {
+        _sessionAllowAll.Remove(toolName);
         _sessionDenyAll.Add(toolName);
         return new(false,
             $"{toolName} was denied for this session by the user. " +

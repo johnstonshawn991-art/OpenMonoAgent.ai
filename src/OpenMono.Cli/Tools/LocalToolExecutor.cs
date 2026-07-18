@@ -10,23 +10,6 @@ using OpenMono.Utils;
 
 namespace OpenMono.Tools;
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 public sealed class LocalToolExecutor : IToolExecutor
 {
     private readonly TurnJournal _journal;
@@ -38,6 +21,7 @@ public sealed class LocalToolExecutor : IToolExecutor
     private readonly ArtifactStore _artifactStore;
     private readonly HookRunner _hookRunner;
     private readonly IAcpEventSink? _sink;
+    private int _activeToolCount;
 
     public LocalToolExecutor(
         TurnJournal journal,
@@ -117,6 +101,7 @@ public sealed class LocalToolExecutor : IToolExecutor
         // filtering — a weak model can still emit a call for a tool it was never offered.
         // PlanModePolicy is the single allowlist; blocked calls never execute and surface a
         // clean, generic "blocked in plan mode" signal to the UI (start + failed end).
+        Log.Info($"[OMA_MODE_GATE] PlanMode={_session.Meta.PlanMode}, Tool={call.Name}, IsReadOnly={tool.IsReadOnly}");
         if (_session.Meta.PlanMode && !PlanModePolicy.IsToolAllowed(tool))
         {
             var planModeError = PlanModePolicy.BlockedMessage(call.Name);
@@ -137,17 +122,24 @@ public sealed class LocalToolExecutor : IToolExecutor
 
         Console.Error.WriteLine($"[EXEC_PERM] {tool.Name}: capabilities.Count={capabilities.Count}, AutoApproveWrites={_session.Meta.AutoApproveWrites}, IsReadOnly={tool.IsReadOnly}");
 
-        // "Auto implement" for an approved plan: write/exec tools are pre-approved, so skip the
-        // per-edit permission prompt. "Ask before edits" leaves AutoApproveWrites false → normal
-        // prompting below. (Read-only tools are unaffected; the plan-mode gate already ran above.)
-        if (_session.Meta.AutoApproveWrites && !tool.IsReadOnly)
+        if (tool.IsReadOnly)
         {
+            // Read-only tools never need user permission, regardless of capabilities
+            // They can read but not write, so no user approval needed
+            Console.Error.WriteLine($"[EXEC_PERM] {tool.Name}: AUTO-APPROVED (read-only tool)");
+            allowed = true;
+            reason = null;
+        }
+        else if (_session.Meta.AutoApproveWrites)
+        {
+            // Write tools in auto-approve mode (from approved plan execution)
             Console.Error.WriteLine($"[EXEC_PERM] {tool.Name}: AUTO-APPROVED (AutoApproveWrites)");
             allowed = true;
             reason = null;
         }
         else if (capabilities.Count > 0)
         {
+            // Write tools with required capabilities - ask for permission
             Console.Error.WriteLine($"[EXEC_PERM] {tool.Name}: checking {capabilities.Count} capabilities");
             var capDecision = await _permissions.CheckCapabilitiesAsync(tool.Name, capabilities, ct);
             allowed = capDecision.Allowed;
@@ -156,6 +148,7 @@ public sealed class LocalToolExecutor : IToolExecutor
         }
         else
         {
+            // Write tools without capabilities - use legacy permission check
             Console.Error.WriteLine($"[EXEC_PERM] {tool.Name}: using legacy permission check");
             var permLevel = tool.RequiredPermission(input);
             var legacyDecision = await _permissions.CheckAsync(tool.Name, input, permLevel, ct);
@@ -199,6 +192,14 @@ public sealed class LocalToolExecutor : IToolExecutor
         _output.WriteToolStart(call.Name, call.Arguments);
         _session.Meta.TokenTracker?.RecordToolUse(call.Name);
         _journal.RecordToolStarted(call.Id);
+
+        // The static WriteToolStart line above is a one-shot print — with nothing further until
+        // the tool returns, a slow tool (a long Bash command, a sub-agent, a big fetch) leaves the
+        // terminal looking frozen. Show a live indicator for the duration of execution instead.
+        // ponytail: label reflects whichever concurrent call started the indicator first when
+        // several concurrency-safe tools overlap; upgrade to a per-call label if that's confusing.
+        if (System.Threading.Interlocked.Increment(ref _activeToolCount) == 1)
+            _output.ShowWaitingIndicator($"Running {call.Name}");
 
         // OnToolStartAsync already called above (before permission check), don't call again
         var stopwatch = Stopwatch.StartNew();
@@ -281,6 +282,11 @@ public sealed class LocalToolExecutor : IToolExecutor
                 }
             }
         }
+        catch (PendingUserResponseException)
+        {
+            // User interaction pending (permission, input, etc.) — propagate to turn runner
+            throw;
+        }
         catch (OperationCanceledException) when (timeoutCts is { IsCancellationRequested: true } && !ct.IsCancellationRequested)
         {
             var secs = tool.Timeout!.Value.TotalSeconds;
@@ -307,6 +313,8 @@ public sealed class LocalToolExecutor : IToolExecutor
         finally
         {
             timeoutCts?.Dispose();
+            if (System.Threading.Interlocked.Decrement(ref _activeToolCount) == 0)
+                _output.ClearWaitingIndicator();
         }
 
         stopwatch.Stop();

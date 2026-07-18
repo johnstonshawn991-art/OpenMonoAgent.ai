@@ -33,6 +33,12 @@ public sealed class TokenTracker
         OnUsageUpdated?.Invoke(TotalPromptTokens, TotalCompletionTokens);
     }
 
+    // Display-only: right after a compaction/checkpoint, the context indicator should reflect
+    // the new (smaller) occupancy immediately rather than showing the pre-compaction number
+    // until the next real API response reports usage. Unlike RecordUsage, this must not touch
+    // the cumulative cost totals or ApiCalls — no API call happened for the main conversation.
+    public void SetEstimatedPromptTokens(int estimatedTokens) => LastPromptTokens = estimatedTokens;
+
     // Fold one turn's generation timings into the rolling average and store the live rate.
     public void RecordTimings(int predictedTokens, double predictedMs, double predictedPerSecond)
     {

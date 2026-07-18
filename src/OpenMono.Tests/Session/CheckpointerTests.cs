@@ -47,11 +47,58 @@ public class CheckpointerTests
         window.Should().NotContain(m => m.Content == "old-reply");
     }
 
+    [Fact]
+    public async Task CreateCheckpointAsync_KeepsPendingToolCall_VisibleInContextWindow()
+    {
+        var cp = new Checkpointer(new SummaryLlm(), contextSize: 100_000);
+        var session = SessionManager.CreateSession();
+        session.AddMessage(new Message { Role = MessageRole.System, Content = "sys" });
+
+        for (var i = 0; i < 2; i++)
+        {
+            session.AddMessage(new Message { Role = MessageRole.User, Content = $"pre {i}" });
+            session.AddMessage(new Message { Role = MessageRole.Assistant, Content = $"pre-reply {i}" });
+        }
+
+        session.AddMessage(new Message { Role = MessageRole.User, Content = "delete the prod table" });
+        session.AddMessage(new Message
+        {
+            Role = MessageRole.Assistant,
+            ToolCalls = [new ToolCall { Id = "call_pending", Name = "DangerousTool", Arguments = "{}" }],
+        });
+
+        for (var i = 0; i < 5; i++)
+        {
+            session.AddMessage(new Message { Role = MessageRole.User, Content = $"meanwhile {i}" });
+            session.AddMessage(new Message { Role = MessageRole.Assistant, Content = $"ok {i}" });
+        }
+
+        await cp.CreateCheckpointAsync(session, CancellationToken.None);
+        var window = cp.BuildContextWindow(session);
+
+        window.Should().Contain(m => m.ToolCalls != null && m.ToolCalls.Any(c => c.Id == "call_pending"),
+            "a tool call still awaiting a permission decision must stay visible in context — hiding it " +
+            "behind a checkpoint summary would desync the model's view of pending tool_use/tool_result pairs");
+    }
+
     private sealed class UnusedLlm : ILlmClient
     {
         public IAsyncEnumerable<StreamChunk> StreamChatAsync(
             IReadOnlyList<Message> messages, JsonElement? toolDefs, LlmOptions options, CancellationToken ct)
             => throw new InvalidOperationException("LLM must not be called by BuildContextWindow");
+
+        public void Dispose() { }
+    }
+
+    private sealed class SummaryLlm : ILlmClient
+    {
+        public async IAsyncEnumerable<StreamChunk> StreamChatAsync(
+            IReadOnlyList<Message> messages, JsonElement? toolDefs, LlmOptions options,
+            [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct)
+        {
+            yield return new StreamChunk { TextDelta = "summary of old turns", IsComplete = true };
+            await Task.CompletedTask;
+        }
 
         public void Dispose() { }
     }

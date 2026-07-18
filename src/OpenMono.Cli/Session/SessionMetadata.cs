@@ -8,6 +8,8 @@ public sealed class SessionMetadata
     public TokenTracker? TokenTracker { get; set; }
     public bool PlanMode { get; set; }
     public bool ThinkingEnabled { get; set; }
+    /// <summary>True while a compaction is actively rewriting session history — drives the "Compacting…" status and ring animation.</summary>
+    public bool IsCompacting { get; set; }
     /// <summary>
     /// When true, write/exec tools are auto-approved (no per-edit permission prompt). Set when
     /// the user chooses "Auto implement" for a plan; "Ask before edits" leaves it false so

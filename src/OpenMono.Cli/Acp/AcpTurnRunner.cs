@@ -71,6 +71,79 @@ public sealed class AcpTurnRunner : IAcpEventSink
 
     public async Task RunUserMessageAsync(string userText, CancellationToken ct)
     {
+        var trimmed = userText.TrimStart();
+        if (trimmed.StartsWith('/') && await TryHandleSlashCommandAsync(trimmed.Trim(), ct))
+            return;
+        await SubmitUserMessageAsync(userText, ct);
+    }
+
+    private static string SlashHelpText() =>
+        "**Commands**\n" +
+        "- `/plan [task]` — enter Plan mode (read-only); with a task, propose a plan for it\n" +
+        "- `/build` — switch to Build mode (make changes)\n" +
+        "- `/mode` — toggle Plan / Build\n" +
+        "- `/think` — toggle step-by-step reasoning\n" +
+        "- `/help` — show this list\n\n" +
+        "Also available: `/clear`, `/sessions`, `/undo`, `/redo`, `/stop`.";
+
+    private async Task<bool> TryHandleSlashCommandAsync(string text, CancellationToken ct)
+    {
+        var space = text.IndexOf(' ');
+        var cmd = (space < 0 ? text : text[..space]).ToLowerInvariant();
+        var args = space < 0 ? "" : text[(space + 1)..].Trim();
+
+        switch (cmd)
+        {
+            case "/help":
+                await OnTextDeltaAsync(SlashHelpText());
+                await _writer.WriteEventAsync("done", new { });
+                return true;
+
+            case "/mode":
+                _acpSession.PlanMode = !_acpSession.PlanMode;
+                await OnModeChangedAsync(_acpSession.PlanMode ? "plan" : "build");
+                await OnTextDeltaAsync(_acpSession.PlanMode
+                    ? "Switched to **Plan mode** — read-only. I'll investigate and propose a plan before changes."
+                    : "Switched to **Build mode** — I can make changes now.");
+                await _writer.WriteEventAsync("done", new { });
+                return true;
+
+            case "/build":
+                _acpSession.PlanMode = false;
+                await OnModeChangedAsync("build");
+                await OnTextDeltaAsync("Switched to **Build mode** — I can make changes now.");
+                await _writer.WriteEventAsync("done", new { });
+                return true;
+
+            case "/think":
+                _acpSession.State.Meta.ThinkingEnabled = !_acpSession.State.Meta.ThinkingEnabled;
+                await OnTextDeltaAsync(_acpSession.State.Meta.ThinkingEnabled
+                    ? "**Thinking mode ON** — I'll reason step-by-step before responding (uses extra context)."
+                    : "**Thinking mode OFF** — I'll respond directly.");
+                await _writer.WriteEventAsync("done", new { });
+                return true;
+
+            case "/plan":
+                _acpSession.PlanMode = true;
+                await OnModeChangedAsync("plan");
+                if (args.Length > 0)
+                {
+                    await SubmitUserMessageAsync(ModeInstructions.PlanTask(args), ct);
+                }
+                else
+                {
+                    await OnTextDeltaAsync("Switched to **Plan mode** — read-only. Tell me what to plan and I'll propose a plan for your approval.");
+                    await _writer.WriteEventAsync("done", new { });
+                }
+                return true;
+
+            default:
+                return false;
+        }
+    }
+
+    private async Task SubmitUserMessageAsync(string userText, CancellationToken ct)
+    {
         // Ensure system prompt is set on first message
         if (_acpSession.Messages.Count == 0 || _acpSession.Messages[0].Role != MessageRole.System)
         {
@@ -114,19 +187,18 @@ public sealed class AcpTurnRunner : IAcpEventSink
         var decision = payload.TryGetProperty("decision", out var dEl) ? dEl.GetString() : null;
         var allow = string.Equals(decision, "allow", StringComparison.Ordinal);
 
-        // SCOPE-AWARE PERMISSION HANDLING (Phase 1 Implementation)
+        // SCOPE-AWARE PERMISSION HANDLING
         // ─────────────────────────────────────────────────────────
         // scope: "session" → cache the decision for the entire session
-        //   - Tool will not be re-prompted for this type/capability in this session
-        //   - Stored in _acpSession.RememberPermission() (session-level cache)
+        //   - Tool will not be re-prompted for this type in this session
+        //   - Stored in _acpSession.RememberPermission(contextKey, allow, "session")
         //
-        // scope: "once" (default) → decision applies to only this invocation
-        //   - No cache write; per-turn temporary scope
-        //   - Future: consider per-turn denial tracking to prevent re-prompting same denied tool
+        // scope: "once" → decision applies to only this invocation
+        //   - For allow: temporary grant, forgotten after execution
+        //   - For deny: temporary rejection
         //
-        // Security: Default to "once" scope if not specified. Extension must explicitly
-        // choose "session" to get session-wide caching behavior.
-        var scope = payload.TryGetProperty("scope", out var sEl) ? sEl.GetString() : "once";
+        // Default: "once" if not specified by extension
+        var scope = (payload.TryGetProperty("scope", out var sEl) ? sEl.GetString() : null) ?? "once";
 
         var ctx = _acpSession.LookupPauseContext(id)
             ?? throw new InvalidOperationException($"permission_response for unknown or already-resolved pause id: {id}");
@@ -141,10 +213,10 @@ public sealed class AcpTurnRunner : IAcpEventSink
         // "once"    → for an allow, seed a TEMPORARY grant so the resumed execution does
         //             not re-prompt, then forget it (below) so a later call prompts again.
         var isCaching = string.Equals(scope, "session", StringComparison.Ordinal);
-        if (isCaching)
-            _acpSession.RememberPermission(ctx.ContextKey, allow);
-        else if (allow)
-            _acpSession.RememberPermission(ctx.ContextKey, true);
+        if (allow)
+            _acpSession.RememberPermission(ctx.ContextKey, true, scope);
+        else
+            _acpSession.RememberPermission(ctx.ContextKey, false, scope);
 
         Log.Info($"[OMA_PERM] Resolved: id={id} decision={decision} scope={scope} caching={isCaching} contextKey={ctx.ContextKey}");
 
@@ -152,7 +224,7 @@ public sealed class AcpTurnRunner : IAcpEventSink
         // feed the REAL result back to the model. This replaces the old "re-issue the tool
         // call" handshake, which never executed the tool (file unwritten) and let the model
         // hallucinate success from a bare "permission granted" message.
-        // Operates directly on the persistent session state (no copy/sync needed).
+        // Uses shared session state; modifications are persisted automatically.
         var sessionState = _acpSession.State;
         sessionState.Meta.TokenTracker ??= new TokenTracker();
         using var loop = _loopFactory.Create(sessionState, sink: this, interaction: _interaction);
@@ -165,8 +237,32 @@ public sealed class AcpTurnRunner : IAcpEventSink
             finally
             {
                 // Strict "once": the temporary grant only ever covers the resumed execution.
-                if (allow && !isCaching)
+                if (!isCaching)
                     _acpSession.ForgetPermission(ctx.ContextKey);
+            }
+
+            // Check if there are queued permissions to process
+            var nextQueued = _acpSession.DequeueNextPermission();
+            if (nextQueued.HasValue)
+            {
+                var next = nextQueued.Value;
+                Log.Info($"[OMA_PERM_QUEUE] Processing next queued permission: id={next.Id} tool={next.ToolName}");
+
+                // Register the next permission pause
+                var nextTcs = _acpSession.RegisterPause(next.Id, PendingResponseKind.Permission,
+                    AcpUserInteractionForwarder.PermissionContextKey(next.ToolName, next.Summary));
+
+                // Emit the next permission_request
+                await _writer.WriteEventAsync("permission_request", new
+                {
+                    id = next.Id,
+                    tool = next.ToolName,
+                    summary = next.Summary,
+                    dangerous = next.Dangerous,
+                });
+
+                // Don't continue turn yet - wait for response to this new permission
+                return;
             }
 
             await loop.ContinueTurnAsync(ct);
@@ -260,26 +356,23 @@ public sealed class AcpTurnRunner : IAcpEventSink
         await OnModeChangedAsync("build");
         Log.Info($"[OMA_MODE] User approved mode switch to BUILD for playbook");
 
-        var sessionState = BuildSessionState();
+        var sessionState = _acpSession.State;
+        sessionState.Meta.TokenTracker ??= new TokenTracker();
         using var loop = _loopFactory.Create(sessionState, sink: this, interaction: _interaction);
         try
         {
             await loop.ResolvePendingToolCallsAsync(true, ct);
             await loop.ContinueTurnAsync(ct);
-            SyncBackToAcpSession(sessionState);
             await _writer.WriteEventAsync("done", new { });
         }
         catch (PendingUserResponseException)
         {
-            SyncBackToAcpSession(sessionState);
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
-            SyncBackToAcpSession(sessionState);
         }
         catch (Exception e)
         {
-            SyncBackToAcpSession(sessionState);
             await _writer.WriteEventAsync("error", new { message = e.Message });
         }
     }
@@ -322,7 +415,8 @@ public sealed class AcpTurnRunner : IAcpEventSink
         // Same pattern as FileWrite: find the pending tool call, execute it,
         // capture the result. The tool call gets ONE card with status updates:
         // pause icon → cog → check.
-        var sessionState = BuildSessionState();
+        var sessionState = _acpSession.State;
+        sessionState.Meta.TokenTracker ??= new TokenTracker();
         using var loop = _loopFactory.Create(sessionState, sink: this, interaction: _interaction);
         try
         {
@@ -334,26 +428,21 @@ public sealed class AcpTurnRunner : IAcpEventSink
             {
                 // Playbook triggered a nested pause (e.g., FileWrite permission)
                 // Keep SSE stream open for the nested pause
-                SyncBackToAcpSession(sessionState);
                 throw;
             }
 
             // Continue the turn: agent processes the playbook result
             await loop.ContinueTurnAsync(ct);
-            SyncBackToAcpSession(sessionState);
             await _writer.WriteEventAsync("done", new { });
         }
         catch (PendingUserResponseException)
         {
-            SyncBackToAcpSession(sessionState);
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
-            SyncBackToAcpSession(sessionState);
         }
         catch (Exception e)
         {
-            SyncBackToAcpSession(sessionState);
             await _writer.WriteEventAsync("error", new { message = e.Message });
         }
     }

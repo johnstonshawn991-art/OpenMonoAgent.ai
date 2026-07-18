@@ -407,6 +407,14 @@ public sealed class ConversationLoop : IDisposable
                     continue;
                 }
 
+                if (chunk.ToolCallProgress is not null)
+                {
+                    _output.ShowToolProgress(chunk.ToolCallProgress == "CreatePlan"
+                        ? "Writing plan"
+                        : $"Preparing {chunk.ToolCallProgress}");
+                    continue;
+                }
+
                 if (!receivedFirstChunk)
                 {
                     ttft = requestSw.Elapsed;
@@ -428,6 +436,7 @@ public sealed class ConversationLoop : IDisposable
 
                 if (chunk.ToolCallDelta is not null)
                 {
+                    _output.ClearToolProgress();
                     var call = chunk.ToolCallDelta;
                     toolCalls.Add(call);
 
@@ -463,6 +472,7 @@ public sealed class ConversationLoop : IDisposable
                     indicatorCts.Cancel();
                 await indicatorTask;
                 _output.ClearWaitingIndicator();
+                _output.ClearToolProgress();
             }
 
             if (thinkingStarted && !thinkingCollapsed)
@@ -513,8 +523,10 @@ public sealed class ConversationLoop : IDisposable
             // ExitPlanMode flips _session.Meta.PlanMode) can be detected and pushed to the
             // frontend below — the agent must never change mode without the UI/TUI learning.
             var planModeBeforeTools = _session.Meta.PlanMode;
+            Log.Info($"[OMA_MODE_DETECT] Before tools: PlanMode={planModeBeforeTools}");
 
             var results = await ExecuteToolCallsWithInflightAsync(toolCalls, inFlightTasks, context, siblingAbortCts, ct);
+            Log.Info($"[OMA_MODE_DETECT] ExecuteToolCallsWithInflightAsync returned normally");
 
             foreach (var (call, result) in toolCalls.Zip(results))
             {
@@ -546,12 +558,14 @@ public sealed class ConversationLoop : IDisposable
             // Agent-initiated mode change (EnterPlanMode / ExitPlanMode): keep both frontends
             // in sync. Push an SSE event to the extension UI and print to the TUI. Done here
             // (before the BreakTurn early-return) so ExitPlanMode's plan→build flip is covered.
+            Log.Info($"[OMA_MODE_DETECT] After tools: PlanMode={_session.Meta.PlanMode}, Before={planModeBeforeTools}, _sink={(_sink != null ? "present" : "null")}");
             if (_session.Meta.PlanMode != planModeBeforeTools)
             {
                 var modeStr = _session.Meta.PlanMode ? "plan" : "build";
                 _output.WriteInfo(_session.Meta.PlanMode
                     ? "✓ Switched to Plan mode — only read-only tools are available"
                     : "✓ Switched to Build mode — all tools are available");
+                Log.Info($"[OMA_MODE_DETECT] Mode changed! Calling OnModeChangedAsync('{modeStr}')");
                 if (_sink is not null) await _sink.OnModeChangedAsync(modeStr);
                 Log.Info($"[OMA_MODE] Agent changed mode mid-turn → {modeStr.ToUpperInvariant()}; notified frontend");
             }
@@ -580,8 +594,9 @@ public sealed class ConversationLoop : IDisposable
                     else
                     {
                         // TUI: show the plan + options; the user types 1/2/3 to choose.
+                        _output.WriteInfo("📋 Plan ready — review below:");
                         _output.WriteMarkdown(planText);
-                        _output.WriteInfo($"\n{ModeInstructions.ProceedOptions}\n\n(reply 1/2/3, or keep typing to refine the plan)");
+                        _output.WriteInfo($"\n{ModeInstructions.ProceedOptions}\n\n(press 1, 2, or 3 — no Enter needed)");
                     }
                 }
                 _session.AddMessage(new Message
@@ -734,11 +749,34 @@ public sealed class ConversationLoop : IDisposable
     private async Task RunCompactionAsync(int promptTokens, string? customInstructions, CancellationToken ct)
     {
         _output.WriteDebug($"[Compact] Triggered — messages={_session.Messages.Count} lastPromptTokens={promptTokens}");
-        var (compacted, report) = await _compactor.CompactAsync(_session, customInstructions, ct);
+        _session.Meta.IsCompacting = true;
+        _output.ShowWaitingIndicator("Compacting");
+        CompactionReport report;
+        try
+        {
+            SessionState compacted;
+            (compacted, report) = await _compactor.CompactAsync(_session, customInstructions, ct);
 
-        _session.Messages.Clear();
-        foreach (var msg in compacted.Messages)
-            _session.AddMessage(msg);
+            _session.Messages.Clear();
+            foreach (var msg in compacted.Messages)
+                _session.AddMessage(msg);
+
+            // Compaction re-summarises full raw history, so any prior checkpoint (which pointed
+            // at an index into the now-discarded message list) is stale — drop it, or
+            // BuildContextWindow would splice a checkpoint bubble that no longer lines up.
+            _session.Checkpoints.Clear();
+            _session.CheckpointCutoffIndex = 0;
+        }
+        finally
+        {
+            _session.Meta.IsCompacting = false;
+            _output.ClearWaitingIndicator();
+        }
+
+        // Reflect the new (smaller) occupancy immediately, rather than leaving the pre-compaction
+        // number on screen until the next real LLM response reports usage.
+        _session.Meta.TokenTracker?.SetEstimatedPromptTokens(report.TokensAfter);
+        await EmitUsageAsync();
 
         report.RenderTo(_output.WriteInfo, promptTokens);
         _output.WriteDebug($"[Compact] Done — {_session.Messages.Count} messages remaining");
@@ -880,6 +918,12 @@ public sealed class ConversationLoop : IDisposable
                     await siblingAbortCts.CancelAsync();
                 }
             }
+            catch (PendingUserResponseException)
+            {
+                // User interaction pending (permission, input, etc.) — propagate to turn runner to pause
+                Log.Info($"[PENDING_RESPONSE] Tool {call.Name} paused for user response — re-throwing to turn runner");
+                throw;
+            }
             catch (OperationCanceledException) when (siblingAbortCts.IsCancellationRequested && !ct.IsCancellationRequested)
             {
 
@@ -902,7 +946,16 @@ public sealed class ConversationLoop : IDisposable
                 continue;
             }
 
-            results[item.Index] = await _executor.ExecuteAsync(item.Call, item.Tool, context, ct);
+            try
+            {
+                results[item.Index] = await _executor.ExecuteAsync(item.Call, item.Tool, context, ct);
+            }
+            catch (PendingUserResponseException)
+            {
+                // User interaction pending (permission, input, etc.) — propagate to turn runner to pause
+                Log.Info($"[PENDING_RESPONSE] Tool {item.Call.Name} paused for user response — re-throwing to turn runner");
+                throw;
+            }
         }
 
         return [.. results];

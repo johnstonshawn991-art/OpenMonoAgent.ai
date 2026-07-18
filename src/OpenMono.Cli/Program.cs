@@ -77,7 +77,6 @@ for (var i = 0; i < args.Length; i++)
             Console.WriteLine("  /help              List all commands");
             Console.WriteLine("  /status            Current session info (turns, tokens, model)");
             Console.WriteLine("  /stats             Token usage and tool analytics");
-            Console.WriteLine("  /model <name>      Switch model mid-session");
             Console.WriteLine("  /compact           Summarize history to free context space");
             Console.WriteLine("  /clear             Wipe conversation and start fresh");
             Console.WriteLine("  /retry             Resend the last message");
@@ -151,7 +150,11 @@ static async Task RunAgentAsync(string? endpoint, string? model, string? workdir
     using var llm = providerRegistry.CreateClient(config);
 
     Action<string> debugCallback = msg => renderer.WriteDebug(msg);
-    if (llm is OpenAiCompatClient openAiClient) openAiClient.OnDebug = debugCallback;
+    if (llm is OpenAiCompatClient openAiClient)
+    {
+        openAiClient.OnDebug = debugCallback;
+        openAiClient.OnModelReported = m => config.Llm.Model = m;
+    }
     if (llm is AnthropicClient anthropicClient) anthropicClient.OnDebug = debugCallback;
 
     var fileHistory = new FileHistory(config);
@@ -369,7 +372,7 @@ static async Task RunAgentAsync(string? endpoint, string? model, string? workdir
 
     commands.Register(new RetryCommand(loop));
     commands.Register(new CompactCommand(compactor));
-    commands.Register(new ModelCommand());
+    commands.Register(new PlanCommand(loop));
 
     renderer.EnableCommandSuggestions(commands);
 
@@ -412,7 +415,7 @@ static async Task RunAgentAsync(string? endpoint, string? model, string? workdir
 
 
             try { acpHost?.StopAsync(CancellationToken.None).GetAwaiter().GetResult(); }
-            catch { }
+            catch (Exception ex) { Log.Debug($"ACP host stop on exit failed: {ex.Message}"); }
             ProcessWatchdog.ScheduleHardKill();
             ansiTui?.SafeExit();
             Environment.Exit(0);
@@ -425,7 +428,17 @@ static async Task RunAgentAsync(string? endpoint, string? model, string? workdir
         string input;
         try
         {
-            input = InputSanitizer.SanitizeUserInput(renderer.ReadInput());
+            if (ansiTui is not null && session.Meta.PlanMode && session.Meta.LastPlanContent is { Length: > 0 })
+            {
+                var key = ansiTui.ReadMenuKey('1', '2', '3');
+                input = key == '\0'
+                    ? InputSanitizer.SanitizeUserInput(renderer.ReadInput())
+                    : key.ToString();
+            }
+            else
+            {
+                input = InputSanitizer.SanitizeUserInput(renderer.ReadInput());
+            }
         }
         catch (OperationCanceledException)
         {
@@ -438,9 +451,11 @@ static async Task RunAgentAsync(string? endpoint, string? model, string? workdir
 
         if (input.Trim() is "exit" or "quit" or "q")
         {
-            ProcessWatchdog.ScheduleHardKill();
-            ansiTui?.SafeExit();
-            Environment.Exit(0);
+            if (currentTurnCts is { } activeCts && !activeCts.IsCancellationRequested)
+                activeCts.Cancel();
+            else
+                renderer.WriteInfo("Nothing is running. Type /quit to exit OpenMono.");
+            continue;
         }
 
         if (input.StartsWith('/'))
@@ -522,11 +537,31 @@ static async Task RunAgentAsync(string? endpoint, string? model, string? workdir
             };
             if (choice == "keep")
             {
-                renderer.WriteInfo("Staying in Plan mode — refine the plan, or pick 1 (auto) / 2 (ask before edits).");
-                continue;
+                renderer.WriteInfo("What would you like to change or add to the plan? (press Enter to keep planning without changes)");
+                var refinement = InputSanitizer.SanitizeUserInput(renderer.ReadInput()).Trim();
+                if (refinement.Length == 0)
+                {
+                    renderer.WriteInfo("Staying in Plan mode — press 3 to refine, or 1 (auto) / 2 (ask before edits) to implement.");
+                    continue;
+                }
+                input = refinement;
+                renderer.WriteInfo("♻ Refining the plan…");
+                transformedInput = ModeInstructions.RefinePlan(
+                    FileReferenceResolver.TransformRelativeReferences(refinement, config.WorkingDirectory));
             }
             if (choice is "auto" or "gated")
             {
+                // One-time gate before any work begins: implementation never starts silently.
+                renderer.WriteInfo("Start implementing this plan? (y/n)");
+                var confirm = ansiTui is not null
+                    ? ansiTui.ReadMenuKey('y', 'n')
+                    : (InputSanitizer.SanitizeUserInput(renderer.ReadInput()).Trim().ToLowerInvariant() is "y" or "yes" ? 'y' : 'n');
+                if (confirm != 'y')
+                {
+                    renderer.WriteInfo("Held off — still in Plan mode. Press 1 (auto) / 2 (ask before edits), or 3 to refine.");
+                    continue;
+                }
+
                 var (_, autoApprove, instruction) = ModeInstructions.ResolvePlanDecision(choice);
                 session.Meta.PlanMode = false;
                 session.Meta.AutoApproveWrites = autoApprove;
@@ -600,15 +635,18 @@ static async Task RunAgentAsync(string? endpoint, string? model, string? workdir
         {
             currentTurnCts = null;
             if (ansiTui is not null) ansiTui.CurrentTurnCts = null;
+            // Scope plan auto-approve to the single implementation turn — never let it persist
+            // across the session (that would silently disable all future permission prompts).
+            session.Meta.AutoApproveWrites = false;
         }
 
         try
         {
             await sessionManager.SaveAsync(session, CancellationToken.None);
         }
-        catch
+        catch (Exception ex)
         {
-
+            Log.Warn($"Session autosave failed (turn loop): {ex.Message}");
         }
     }
 
@@ -632,7 +670,7 @@ static async Task<bool> IsServerWarmAsync(string endpoint)
             return true;
         }
     }
-    catch { }
+    catch (Exception ex) { Log.Debug($"Server warmth probe failed: {ex.Message}"); }
     return false;
 }
 
@@ -959,8 +997,8 @@ static async Task AutoDetectCodeGraphAsync(AppConfig config, IRenderer renderer)
 
         renderer.WriteInfo("code-review-graph detected — registering as MCP server.");
     }
-    catch
+    catch (Exception ex)
     {
-
+        Log.Debug($"code-review-graph autodetect failed: {ex.Message}");
     }
 }
