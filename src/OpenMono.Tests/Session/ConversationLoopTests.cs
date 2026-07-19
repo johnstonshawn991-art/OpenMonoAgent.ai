@@ -30,7 +30,7 @@ public class ConversationLoopTests
         var permissions = new PermissionEngine(config, renderer, renderer);
         var loop = new ConversationLoop(llm, tools, permissions, renderer, renderer, renderer, config, session);
 
-        await loop.RunTurnAsync("Hi there", CancellationToken.None);
+        await loop.RunTurnAsync("Hi there", null, CancellationToken.None);
 
         session.Messages.Should().HaveCount(3);
         session.Messages[0].Role.Should().Be(MessageRole.System);
@@ -70,7 +70,7 @@ public class ConversationLoopTests
         var permissions = new PermissionEngine(config, renderer, renderer);
         var loop = new ConversationLoop(llm, tools, permissions, renderer, renderer, renderer, config, session);
 
-        await loop.RunTurnAsync("run test tool", CancellationToken.None);
+        await loop.RunTurnAsync("run test tool", null, CancellationToken.None);
 
         session.Messages.Count.Should().BeGreaterThanOrEqualTo(5);
         session.Messages.Any(m => m.Role == MessageRole.Tool).Should().BeTrue();
@@ -94,10 +94,46 @@ public class ConversationLoopTests
         var config = new AppConfig();
         var loop = new ConversationLoop(llm, new ToolRegistry(), new PermissionEngine(config, renderer, renderer), renderer, renderer, renderer, config, session);
 
-        await loop.RunTurnAsync("Hello", CancellationToken.None);
+        await loop.RunTurnAsync("Hello", null, CancellationToken.None);
 
         tracker.TotalPromptTokens.Should().Be(50);
         tracker.TotalCompletionTokens.Should().Be(20);
+    }
+
+    [Fact]
+    public async Task RunManualCompactionAsync_ResetsStaleCheckpointState()
+    {
+        var llm = new FakeLlmClient([
+            new StreamChunk { TextDelta = "summary of old turns", IsComplete = true },
+        ]);
+
+        var session = new SessionState();
+        session.AddMessage(new Message { Role = MessageRole.System, Content = "System" });
+        for (var i = 0; i < 6; i++)
+        {
+            session.AddMessage(new Message { Role = MessageRole.User, Content = $"user {i}" });
+            session.AddMessage(new Message { Role = MessageRole.Assistant, Content = $"assistant {i}" });
+        }
+
+        // A checkpoint left over from earlier in the session, pointing into the message
+        // list as it exists *before* this compaction rewrites it.
+        session.Checkpoints.Add(new CheckpointEntry
+        {
+            Id = "stale", CreatedAt = DateTime.UtcNow, TurnIndex = 1, CutoffMessageIndex = 5, Summary = "stale summary",
+        });
+        session.CheckpointCutoffIndex = 5;
+
+        var renderer = new TerminalRenderer();
+        var config = new AppConfig();
+        var loop = new ConversationLoop(llm, new ToolRegistry(), new PermissionEngine(config, renderer, renderer),
+            renderer, renderer, renderer, config, session);
+
+        await loop.RunManualCompactionAsync(null, CancellationToken.None);
+
+        session.Checkpoints.Should().BeEmpty(
+            "a full compaction re-summarises everything from raw history, so a checkpoint " +
+            "pointing into the pre-compaction message list is stale and must be dropped");
+        session.CheckpointCutoffIndex.Should().Be(0);
     }
 
     [Fact]
@@ -129,10 +165,10 @@ public class ConversationLoopTests
         var loop = new ConversationLoop(llm, tools, new PermissionEngine(config, renderer, renderer),
             renderer, renderer, renderer, config, session);
 
-        await loop.RunTurnAsync("Turn 1", CancellationToken.None);
-        await loop.RunTurnAsync("Turn 2", CancellationToken.None);
+        await loop.RunTurnAsync("Turn 1", null, CancellationToken.None);
+        await loop.RunTurnAsync("Turn 2", null, CancellationToken.None);
 
-        await loop.RunTurnAsync("Completely different prompt after checkpoint", CancellationToken.None);
+        await loop.RunTurnAsync("Completely different prompt after checkpoint", null, CancellationToken.None);
 
         session.Messages
             .Where(m => m.Role == MessageRole.User)
@@ -164,7 +200,7 @@ public class ConversationLoopTests
         var loop = new ConversationLoop(llm, tools, new PermissionEngine(config, renderer, renderer),
             renderer, renderer, renderer, config, session);
 
-        await loop.RunTurnAsync("Do the thing", CancellationToken.None);
+        await loop.RunTurnAsync("Do the thing", null, CancellationToken.None);
 
         session.Messages
             .Where(m => m.Role == MessageRole.User)

@@ -13,6 +13,8 @@ public sealed class ProviderRegistry
         Register(new OpenAiProvider());
         Register(new AnthropicProvider());
         Register(new OllamaProvider());
+        Register(new OpenRouterProvider());
+        Register(new SakanaProvider());
     }
 
     public void Register(IProvider provider) => _providers[provider.Name] = provider;
@@ -117,6 +119,79 @@ internal sealed class OllamaProvider : IProvider
 
     public bool ValidateConfig(ProviderConfig config, out string? error)
     {
+        error = null;
+        return true;
+    }
+}
+
+internal sealed class OpenRouterProvider : IProvider
+{
+    public string Name => "openrouter";
+    public string[] SupportedModels =>
+    [
+        "openrouter/fusion",
+        "anthropic/claude-opus-4",
+        "openai/gpt-4o",
+        "google/gemini-2.5-pro-preview",
+    ];
+
+    public ILlmClient CreateClient(ProviderConfig config)
+    {
+        var apiKey = config.ApiKey ?? Environment.GetEnvironmentVariable("OPENROUTER_API_KEY");
+        return new OpenAiCompatClient(new LlmConfig
+        {
+            Endpoint = config.Endpoint ?? "https://openrouter.ai/api",
+            Model = config.Model ?? "openrouter/fusion",
+            MaxConcurrentRequests = 1,
+        })
+        {
+            ApiKey = apiKey,
+            ExtraHeaders = new Dictionary<string, string>
+            {
+                ["HTTP-Referer"] = "https://openmono.ai",
+                ["X-Title"] = "OpenMono",
+            },
+        };
+    }
+
+    public bool ValidateConfig(ProviderConfig config, out string? error)
+    {
+        var key = config.ApiKey ?? Environment.GetEnvironmentVariable("OPENROUTER_API_KEY");
+        if (string.IsNullOrEmpty(key))
+        {
+            error = "OpenRouter API key required. Set OPENROUTER_API_KEY or configure in settings.";
+            return false;
+        }
+        error = null;
+        return true;
+    }
+}
+
+internal sealed class SakanaProvider : IProvider
+{
+    public string Name => "sakana";
+    public string[] SupportedModels => ["fugu", "fugu-ultra-20260615"];
+
+    public ILlmClient CreateClient(ProviderConfig config)
+    {
+        var apiKey = config.ApiKey ?? Environment.GetEnvironmentVariable("SAKANA_API_KEY");
+        return new OpenAiCompatClient(new LlmConfig
+        {
+            Endpoint = config.Endpoint ?? "https://api.sakana.ai",
+            Model = config.Model ?? "fugu",
+            MaxConcurrentRequests = 1,
+        })
+        { ApiKey = apiKey };
+    }
+
+    public bool ValidateConfig(ProviderConfig config, out string? error)
+    {
+        var key = config.ApiKey ?? Environment.GetEnvironmentVariable("SAKANA_API_KEY");
+        if (string.IsNullOrEmpty(key))
+        {
+            error = "Sakana API key required. Set SAKANA_API_KEY or configure in settings.";
+            return false;
+        }
         error = null;
         return true;
     }

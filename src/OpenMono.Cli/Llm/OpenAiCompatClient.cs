@@ -13,6 +13,10 @@ public sealed class OpenAiCompatClient : ILlmClient, IDisposable
     private readonly HttpClient _http;
     private readonly string _endpoint;
     private const int MaxRetries = 3;
+
+    private static SemaphoreSlim? _requestGate;
+    private static int _gateCapacity;
+    private static readonly object _gateInitLock = new();
     private static readonly TimeSpan[] RetryDelays =
     [
         TimeSpan.FromSeconds(1),
@@ -29,7 +33,10 @@ public sealed class OpenAiCompatClient : ILlmClient, IDisposable
         RegexOptions.Singleline | RegexOptions.Compiled);
 
     public string? ApiKey { get; init; }
+    public IReadOnlyDictionary<string, string>? ExtraHeaders { get; init; }
     public Action<string>? OnDebug { get; set; }
+    public Action<string>? OnModelReported { get; set; }
+    private string? _reportedModel;
 
     private readonly string _model;
 
@@ -38,6 +45,24 @@ public sealed class OpenAiCompatClient : ILlmClient, IDisposable
         _endpoint = config.Endpoint.TrimEnd('/');
         _model = config.Model;
         _http = new HttpClient { Timeout = TimeSpan.FromMinutes(10) };
+        EnsureRequestGate(config.MaxConcurrentRequests);
+    }
+
+    private static SemaphoreSlim EnsureRequestGate(int requested)
+    {
+        var capacity = Math.Max(1, requested);
+        if (_requestGate is { } existing && _gateCapacity == capacity)
+            return existing;
+        lock (_gateInitLock)
+        {
+            if (_requestGate is null || _gateCapacity != capacity)
+            {
+                _requestGate?.Dispose();
+                _requestGate = new SemaphoreSlim(capacity, capacity);
+                _gateCapacity = capacity;
+            }
+            return _requestGate;
+        }
     }
 
     public async IAsyncEnumerable<StreamChunk> StreamChatAsync(
@@ -46,8 +71,14 @@ public sealed class OpenAiCompatClient : ILlmClient, IDisposable
         LlmOptions options,
         [EnumeratorCancellation] CancellationToken ct)
     {
+        var gate = _requestGate!;
+        await gate.WaitAsync(ct);
+        try
+        {
         HttpResponseMessage? response = null;
         var lastException = default(Exception);
+        TimeSpan? pendingRetryAfter = null;
+        var retryDelay = TimeSpan.Zero;
 
         for (var attempt = 0; attempt <= MaxRetries; attempt++)
         {
@@ -55,8 +86,8 @@ public sealed class OpenAiCompatClient : ILlmClient, IDisposable
 
             if (attempt > 0)
             {
-                var delay = RetryDelays[Math.Min(attempt - 1, RetryDelays.Length - 1)];
-                await Task.Delay(delay, ct);
+                retryDelay = RetryPolicy.NextDelay(attempt, pendingRetryAfter, Random.Shared.NextDouble());
+                await Task.Delay(retryDelay, ct);
             }
 
             var requestBody = BuildRequestBody(messages, tools, options, _model);
@@ -69,12 +100,12 @@ public sealed class OpenAiCompatClient : ILlmClient, IDisposable
                 var resolvedModel = string.IsNullOrEmpty(options.Model) ? _model : options.Model;
                 OnDebug?.Invoke($"[LLM] Model: {resolvedModel} | Messages: {messages.Count} | Tools: {toolCount} | MaxTokens: {options.MaxTokens}");
                 Log.Debug($"LLM request: model={resolvedModel} messages={messages.Count} tools={toolCount} endpoint={_endpoint}");
+
             }
             else
             {
-                var delay = RetryDelays[Math.Min(attempt - 1, RetryDelays.Length - 1)];
-                OnDebug?.Invoke($"[LLM] Retry {attempt}/{MaxRetries} after {delay.TotalSeconds}s");
-                Log.Warn($"LLM retry {attempt}/{MaxRetries} after {delay.TotalSeconds}s");
+                OnDebug?.Invoke($"[LLM] Retry {attempt}/{MaxRetries} after {retryDelay.TotalSeconds:F1}s");
+                Log.Warn($"LLM retry {attempt}/{MaxRetries} after {retryDelay.TotalSeconds:F1}s");
             }
 
             var content = new StringContent(requestJson, Encoding.UTF8, "application/json");
@@ -87,6 +118,12 @@ public sealed class OpenAiCompatClient : ILlmClient, IDisposable
             if (ApiKey is not null)
                 request.Headers.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", ApiKey);
 
+            if (ExtraHeaders is not null)
+            {
+                foreach (var (name, value) in ExtraHeaders)
+                    request.Headers.TryAddWithoutValidation(name, value);
+            }
+
             try
             {
                 response = await _http.SendAsync(
@@ -97,6 +134,7 @@ public sealed class OpenAiCompatClient : ILlmClient, IDisposable
                     lastException = new HttpRequestException(
                         $"HTTP {(int)response.StatusCode} {response.StatusCode}",
                         inner: null, response.StatusCode);
+                    pendingRetryAfter = RetryPolicy.ParseRetryAfter(response);
                     response.Dispose();
                     response = null;
                     continue;
@@ -108,6 +146,7 @@ public sealed class OpenAiCompatClient : ILlmClient, IDisposable
             catch (HttpRequestException ex) when (attempt < MaxRetries)
             {
                 lastException = ex;
+                pendingRetryAfter = null;
                 response?.Dispose();
                 response = null;
             }
@@ -115,6 +154,7 @@ public sealed class OpenAiCompatClient : ILlmClient, IDisposable
             {
 
                 lastException = ex;
+                pendingRetryAfter = null;
                 response?.Dispose();
                 response = null;
             }
@@ -150,7 +190,7 @@ public sealed class OpenAiCompatClient : ILlmClient, IDisposable
                     foreach (var tc in toolCalls.Values.Where(t => t.IsComplete))
                     {
                         OnDebug?.Invoke($"[SSE] tool_call: {tc.Name} {{ {tc.Arguments.ToString()[..Math.Min(100, tc.Arguments.Length)]} }}");
-                        Log.Debug($"SSE tool_call: {tc.Name} args={tc.Arguments.ToString()[..Math.Min(200, tc.Arguments.Length)]}");
+                        Log.Info($"[OMA_TOOLCALL] LLM generated tool call: {tc.Name} args={tc.Arguments.ToString()[..Math.Min(200, tc.Arguments.Length)]}");
 
                         yield return new StreamChunk
                         {
@@ -165,7 +205,7 @@ public sealed class OpenAiCompatClient : ILlmClient, IDisposable
 
                     var elapsed = streamStarted.Elapsed;
                     OnDebug?.Invoke($"[LLM] Stream complete — {chunkCount} chunks in {elapsed.TotalSeconds:F1}s");
-                    Log.Debug($"LLM stream complete: chunks={chunkCount} elapsed={elapsed.TotalSeconds:F1}s");
+                    Log.Info($"[OMA_LLM] Stream complete: chunks={chunkCount} tool_calls={toolCalls.Count} elapsed={elapsed.TotalSeconds:F1}s");
 
                     if (toolCalls.Count == 0 && suppressText)
                     {
@@ -221,16 +261,37 @@ public sealed class OpenAiCompatClient : ILlmClient, IDisposable
 
                     chunkCount++;
 
+                    if (root.TryGetProperty("model", out var modelEl) &&
+                        modelEl.ValueKind == JsonValueKind.String &&
+                        modelEl.GetString() is { Length: > 0 } reported &&
+                        reported != _reportedModel)
+                    {
+                        _reportedModel = reported;
+                        OnModelReported?.Invoke(reported);
+                    }
+
                     UsageInfo? usage = null;
                     if (root.TryGetProperty("usage", out var usageEl) &&
                         usageEl.ValueKind == JsonValueKind.Object)
                     {
+                        // llama.cpp appends a `timings` block to the same final chunk that carries `usage`.
+                        // predicted_per_second = live generation rate; predicted_n/ms feed the rolling average.
+                        int predictedN = 0; double predictedMs = 0, predictedPerSec = 0;
+                        if (root.TryGetProperty("timings", out var tEl) && tEl.ValueKind == JsonValueKind.Object)
+                        {
+                            if (tEl.TryGetProperty("predicted_n", out var pn)) predictedN = pn.GetInt32();
+                            if (tEl.TryGetProperty("predicted_ms", out var pms)) predictedMs = pms.GetDouble();
+                            if (tEl.TryGetProperty("predicted_per_second", out var pps)) predictedPerSec = pps.GetDouble();
+                        }
                         usage = new UsageInfo
                         {
                             PromptTokens = usageEl.TryGetProperty("prompt_tokens", out var pt) ? pt.GetInt32() : 0,
                             CompletionTokens = usageEl.TryGetProperty("completion_tokens", out var cpt) ? cpt.GetInt32() : 0,
+                            PredictedTokens = predictedN,
+                            PredictedMs = predictedMs,
+                            PredictedPerSecond = predictedPerSec,
                         };
-                        var usageMsg = $"[SSE] usage: prompt={usage.PromptTokens} completion={usage.CompletionTokens} total={usage.TotalTokens}";
+                        var usageMsg = $"[SSE] usage: prompt={usage.PromptTokens} completion={usage.CompletionTokens} total={usage.TotalTokens} gen_tps={usage.PredictedPerSecond:F1}";
                         OnDebug?.Invoke(usageMsg);
                         Log.Info(usageMsg);
                     }
@@ -289,6 +350,8 @@ public sealed class OpenAiCompatClient : ILlmClient, IDisposable
                                 }
 
                                 acc.IsComplete = true;
+                                if (!string.IsNullOrEmpty(acc.Name))
+                                    yield return new StreamChunk { ToolCallProgress = acc.Name };
                             }
                         }
 
@@ -308,6 +371,11 @@ public sealed class OpenAiCompatClient : ILlmClient, IDisposable
                 }
             }
         }
+        }
+        finally
+        {
+            gate.Release();
+        }
     }
 
     private static bool IsRetryableStatus(System.Net.HttpStatusCode status) =>
@@ -324,6 +392,12 @@ public sealed class OpenAiCompatClient : ILlmClient, IDisposable
         string configModel)
     {
         var model = string.IsNullOrEmpty(options.Model) ? configModel : options.Model;
+
+        // Log message roles being sent to API
+        var msgRoles = string.Join(",", messages.Select(m => m.Role.ToString()[0]));
+        var systemCount = messages.Count(m => m.Role == MessageRole.System);
+        Log.Info($"[OMA_LLM_REQUEST] Building request with {messages.Count} messages: {msgRoles} (system={systemCount})");
+
         var apiMessages = messages.Select<Message, object>(m => m.Role switch
         {
             MessageRole.System => new { role = "system", content = m.Content },

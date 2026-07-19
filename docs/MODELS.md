@@ -25,6 +25,21 @@ Token generation speed is memory-bandwidth bound — the bottleneck is how fast 
 
 Short version: **dense models are fast on GPU, MoE models are fast on CPU.**
 
+### Apple Silicon (Metal)
+
+On macOS the model runs natively against the Metal GPU and unified memory — there's no separate "VRAM vs RAM" split, so the MoE model is the right choice on high-memory Macs. The installer picks the tier from unified memory size:
+
+| Unified memory | Model | Type | Accuracy |
+|----------------|-------|------|----------|
+| 48 GB+ | Qwen3.6-35B-A3B-UD-Q4_K_XL | MoE | Full |
+| 32 GB | Qwen3.5-9B-Q4_K_M | Dense | Lower |
+| 16 GB | Qwen3.5-9B-Q4_K_M | Dense | Lower |
+
+The 35B-A3B MoE activates only ~3B parameters per token, so on a high-bandwidth Apple Silicon chip it hits the same usable-to-fast range as a Linux GPU while keeping full accuracy.
+
+> [!IMPORTANT]
+> Only the 64 GB+ tier (full-accuracy 35B) has been validated as stable. The installer will still configure the lower tiers, but **less than 64 GB is not encouraged** — they fall back to the 9B model with a much tighter context window. 16 GB is the hard floor for native inference; below that, use the agent role with a remote inference box.
+
 ---
 
 ## Why Qwen3.6?
@@ -69,6 +84,19 @@ Token generation is memory-bandwidth bound — **RAM channel count matters as mu
 | Ryzen 9 7940HS | DDR5 5600, dual-channel | ~89 GB/s | ~20 |
 
 > Halving RAM channels halves throughput. Always fill both DIMM slots.
+
+### Apple Silicon (Metal)
+
+Apple Silicon's unified memory has far higher bandwidth than a desktop CPU's DDR5, so the 35B-A3B MoE that runs at ~20 tok/s on a NUC reaches GPU-class speeds on a high-memory Mac.
+
+| Hardware | Unified memory | Model | Context (vision on) | tok/s | Status |
+|----------|----------------|-------|---------------------|-------|--------|
+| M5 Pro | 64 GB | Qwen3.6-35B-A3B-UD-Q4_K_XL (full) | 192k (168k) | ~45–48 | ✅ Recommended / tested |
+| M1 Max | 32 GB | Qwen3.5-9B-Q4_K_M (lower) | 64k (48k) | ~22–27 | ⚠️ Not encouraged |
+| M4 | 16 GB | Qwen3.5-9B-Q4_K_M (lower) | 16k (12k) | ~12–16 | ⚠️ Not encouraged |
+
+> [!IMPORTANT]
+> 64 GB+ unified memory is the recommended, tested configuration — full-accuracy 35B model at the full 192k context. The 32 GB and 16 GB tiers install and run, but **less than 64 GB is not encouraged** — they fall back to the 9B model with much tighter context windows. Below 16 GB, native inference doesn't install at all — use the agent role with a remote inference box.
 
 ### What the speeds feel like
 
@@ -157,12 +185,21 @@ For a single-user setup (typical), keep `--parallel 1` to maximise context. To a
 
 ## Using cloud models instead
 
-> [!CAUTION]
-> Cloud providers (OpenAI, Anthropic, Ollama) are WIP and untested. Local llama.cpp is the only fully supported provider.
+OpenMono is a **standalone agent** (not a Cursor plugin). It runs from the `openmono` CLI or via the optional VS Code/Cursor ACP extension — the agent logic always lives in this repo.
 
-If you prefer a cloud model for a session, switch without restarting:
+For orchestration backends that fan out to multiple frontier models, two first-class providers are built in:
+
+| Provider | Model slug | What it does |
+|----------|------------|--------------|
+| `openrouter` | `openrouter/fusion` | [OpenRouter Fusion](https://openrouter.ai/docs/guides/features/plugins/fusion) — panel of models + judge synthesis |
+| `sakana` | `fugu` / `fugu-ultra-20260615` | [Sakana Fugu](https://sakana.ai/fugu/) — learned multi-agent orchestrator as one API |
+
+Switch without restarting:
 
 ```bash
+/model openrouter/fusion          # OpenRouter Fusion (requires OPENROUTER_API_KEY)
+/model fugu                         # Sakana Fugu (requires SAKANA_API_KEY)
+/model fugu-ultra-20260615          # Sakana Fugu Ultra — max quality, higher latency
 /model claude-sonnet-4-20250514   # Anthropic (requires ANTHROPIC_API_KEY)
 /model gpt-4o                     # OpenAI (requires OPENAI_API_KEY)
 ```
@@ -172,12 +209,26 @@ Or set permanently in `settings.json`:
 ```jsonc
 {
   "providers": {
-    "anthropic": { "api_key": "sk-ant-...", "model": "claude-sonnet-4-20250514", "active": true }
+    "openrouter": {
+      "api_key": "sk-or-...",
+      "model": "openrouter/fusion",
+      "active": true
+    },
+    "sakana": {
+      "api_key": "sk-sakana-...",
+      "model": "fugu",
+      "active": false
+    }
   }
 }
 ```
 
-The local llama-server keeps running in the background — switch back to it any time with `/model qwen3.6-27b`.
+Environment variables: `OPENROUTER_API_KEY`, `SAKANA_API_KEY`, `OPENMONO_PROVIDER=openrouter`.
+
+> [!CAUTION]
+> Cloud providers are newer than local llama.cpp. Local inference remains the default and most tested path. Fusion and Fugu calls are billed per underlying model invocation and may take 2–3× longer than a single-model request.
+
+The local llama-server keeps running in the background — switch back any time with `/model qwen3.6-27b`.
 
 ---
 

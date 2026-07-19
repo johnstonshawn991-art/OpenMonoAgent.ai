@@ -24,11 +24,11 @@ internal sealed partial class AnsiPainter(AppConfig config, SessionState session
     internal const string Fw   = "\x1b[37m";
     internal const string Fk   = "\x1b[90m";
     internal const string Fbb  = "\x1b[38;2;163;255;102m";
-    internal const string BgMain   = "\x1b[40m";
-    internal const string BgInput  = "\x1b[40m";
-    internal const string BgStatus = "\x1b[40m";
-    internal const string BgSide   = "\x1b[40m";
-    internal const string BgSugg   = "\x1b[40m";
+    internal const string BgMain   = "\x1b[49m";
+    internal const string BgInput  = "\x1b[49m";
+    internal const string BgStatus = "\x1b[49m";
+    internal const string BgSide   = "\x1b[49m";
+    internal const string BgSugg   = "\x1b[49m";
 
     internal const int MaxCachedLines           = 5000;
     internal const int TrimThreshold            = 6000;
@@ -55,6 +55,8 @@ internal sealed partial class AnsiPainter(AppConfig config, SessionState session
     private readonly StringBuilder _streamBuf = new();
     private readonly object _streamLock = new();
     private volatile bool _streaming;
+    private volatile string? _toolProgress;
+    private int _toolProgressFrame;
     private int _chunks;
     private double _lastTokSec;
     private readonly Stopwatch _turnTimer = new();
@@ -70,13 +72,21 @@ internal sealed partial class AnsiPainter(AppConfig config, SessionState session
     private int _th;
     private int _sideW;
 
-    private string _thinking = "";
-    private int _thinkingFrame;
+    private sealed class ThinkingStream
+    {
+        public string Mode = "";
+        public string WaitingLabel = "Thinking";
+        public int Frame;
+        public readonly StringBuilder Buffer = new();
+        public readonly object BufferLock = new();
+        public bool Collapsed;
+        public int CollapseChars;
+        public long LastActivityTick;
+    }
+    private const string MainAgentKey = "";
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, ThinkingStream> _thinkingStreams = new();
     private System.Threading.Timer? _thinkingTimer;
-    private readonly StringBuilder _thinkingBuf = new();
-    private readonly object _thinkingBufLock = new();
-    private bool _thinkingCollapsed;
-    private int _thinkingCollapseChars;
+    private readonly object _thinkingTimerLock = new();
 
     private int _heartbeatFrame;
     private long _lastHeartbeatTick;
@@ -99,6 +109,15 @@ internal sealed partial class AnsiPainter(AppConfig config, SessionState session
     private volatile bool _paintInProgress;
     private CancellationTokenSource? _paintCts;
 
+    private volatile bool _laneActive;
+    private string _laneOverlay = "";
+
+    private volatile bool _atOverlayActive;
+    private string _atOverlay = "";
+
+    private volatile bool _suggestionOverlayActive;
+    private string _suggestionOverlay = "";
+
     private readonly List<string> _cachedLines = [];
     private int _cachedMsgCount;
     private int _cachedWidth;
@@ -109,6 +128,16 @@ internal sealed partial class AnsiPainter(AppConfig config, SessionState session
 
     private int _scrollOffset;
     private bool _autoScroll = true;
+
+    private int _selAnchorRow = -1;
+    private int _selAnchorCol;
+    private int _selCursorRow = -1;
+    private int _selCursorCol;
+    private bool _selDragged;
+    private string[] _rowPlainText = [];
+    private string? _toast;
+    private DateTime _toastExpiry;
+    private int _inputCursor;
 
     private Func<string> _getBgInput = () => "";
     private Func<bool> _isTurnActive = () => false;
@@ -299,6 +328,9 @@ internal sealed partial class AnsiPainter(AppConfig config, SessionState session
         }
     }
 
+    internal void ScrollPageUp()   => ScrollBy(Math.Max(1, ConvHeight - 2));
+    internal void ScrollPageDown() => ScrollBy(-Math.Max(1, ConvHeight - 2));
+
     internal void ScrollToTop()
     {
         _scrollOffset = GetMaxScrollOffset();
@@ -309,6 +341,87 @@ internal sealed partial class AnsiPainter(AppConfig config, SessionState session
     {
         _scrollOffset = 0;
         _autoScroll = true;
+    }
+
+    internal void MouseSelectStart(int screenRow, int screenCol)
+    {
+        if (screenRow < 0 || screenRow >= ConvHeight)
+        {
+            ClearSelection();
+            return;
+        }
+        _selAnchorRow = screenRow;
+        _selAnchorCol = Math.Max(0, screenCol);
+        _selCursorRow = screenRow;
+        _selCursorCol = Math.Max(0, screenCol);
+        _selDragged = false;
+        PaintConvThrottled(force: true);
+    }
+
+    internal void MouseSelectExtend(int screenRow, int screenCol)
+    {
+        if (_selAnchorRow < 0) return;
+        _selCursorRow = Math.Clamp(screenRow, 0, ConvHeight - 1);
+        _selCursorCol = Math.Max(0, screenCol);
+        _selDragged = true;
+        PaintConvThrottled(force: true);
+    }
+
+    private (int sr, int sc, int er, int ec) NormalizedSelection()
+    {
+        var anchorFirst = _selAnchorRow < _selCursorRow ||
+            (_selAnchorRow == _selCursorRow && _selAnchorCol <= _selCursorCol);
+        return anchorFirst
+            ? (_selAnchorRow, _selAnchorCol, _selCursorRow, _selCursorCol)
+            : (_selCursorRow, _selCursorCol, _selAnchorRow, _selAnchorCol);
+    }
+
+    internal string? MouseSelectCommit()
+    {
+        if (_selAnchorRow < 0 || !_selDragged)
+        {
+            ClearSelection();
+            return null;
+        }
+
+        var (sr, sc, er, ec) = NormalizedSelection();
+        var sb = new StringBuilder();
+        for (var r = sr; r <= er; r++)
+        {
+            var line = r < _rowPlainText.Length ? _rowPlainText[r] ?? "" : "";
+            var from = r == sr ? Math.Clamp(sc, 0, line.Length) : 0;
+            var to   = r == er ? Math.Clamp(ec, 0, line.Length) : line.Length;
+            if (to > from) sb.Append(line, from, to - from);
+            if (r < er) sb.Append('\n');
+        }
+
+        ClearSelection();
+        var text = sb.ToString();
+        return text.Length == 0 ? null : text;
+    }
+
+    private void ClearSelection()
+    {
+        _selAnchorRow = -1;
+        _selCursorRow = -1;
+        _selDragged = false;
+        PaintConvThrottled(force: true);
+    }
+
+    internal void ShowToast(string message)
+    {
+        _toast = message;
+        _toastExpiry = DateTime.UtcNow.AddMilliseconds(2200);
+        Paint();
+        var expiry = _toastExpiry;
+        _ = Task.Delay(2300).ContinueWith(_ =>
+        {
+            if (_toast is not null && DateTime.UtcNow >= expiry)
+            {
+                _toast = null;
+                Paint();
+            }
+        });
     }
 
     internal void Paint()
@@ -389,7 +502,54 @@ internal sealed partial class AnsiPainter(AppConfig config, SessionState session
         Row(2, opt3);
         Row(1, opt4);
 
-        lock (_writeLock) { W(sb.ToString()); Flush(); }
+        _laneOverlay = sb.ToString();
+        _laneActive  = true;
+        lock (_writeLock) { W(_laneOverlay); Flush(); }
+    }
+
+    internal void ClearLane()
+    {
+        _laneActive  = false;
+        _laneOverlay = "";
+    }
+
+    private void AppendLaneOverlay(StringBuilder sb)
+    {
+        if (_laneActive) sb.Append(_laneOverlay);
+    }
+
+    internal void SetAtOverlay(string overlay)
+    {
+        _atOverlay = overlay;
+        _atOverlayActive = true;
+    }
+
+    internal void ClearAtOverlay()
+    {
+        _atOverlayActive = false;
+        _atOverlay = "";
+    }
+
+    private void AppendAtOverlay(StringBuilder sb)
+    {
+        if (_atOverlayActive) sb.Append(_atOverlay);
+    }
+
+    internal void SetSuggestionOverlay(string overlay)
+    {
+        _suggestionOverlay = overlay;
+        _suggestionOverlayActive = true;
+    }
+
+    internal void ClearSuggestionOverlay()
+    {
+        _suggestionOverlayActive = false;
+        _suggestionOverlay = "";
+    }
+
+    private void AppendSuggestionOverlay(StringBuilder sb)
+    {
+        if (_suggestionOverlayActive) sb.Append(_suggestionOverlay);
     }
 
     internal void ShowCtrlCBanner()
@@ -400,6 +560,7 @@ internal sealed partial class AnsiPainter(AppConfig config, SessionState session
         {
             _ctrlCBannerVisible = false;
             _ctrlCBannerTimer = null;
+            InvalidateFrameBuffer();
             PaintConvThrottled(force: true);
         }, null, dueTime: 2000, period: System.Threading.Timeout.Infinite);
         PaintConvThrottled(force: true);
@@ -508,6 +669,8 @@ internal sealed partial class AnsiPainter(AppConfig config, SessionState session
     {
         ClearThinking();
         _streaming = true;
+        _autoScroll = true;
+        _scrollOffset = 0;
         lock (_streamLock) { _streamBuf.Clear(); }
         _chunks = 0;
         _lastTokSec = 0;
@@ -561,6 +724,7 @@ internal sealed partial class AnsiPainter(AppConfig config, SessionState session
     {
         _turnTimer.Stop();
         _streaming = false;
+        _toolProgress = null;
         ComputeWindowStats();
         string finalText;
         lock (_streamLock) { finalText = _streamBuf.ToString(); _streamBuf.Clear(); }
@@ -568,7 +732,10 @@ internal sealed partial class AnsiPainter(AppConfig config, SessionState session
         if (metrics is { PromptTokens: > 0 } m)
         {
             var genTime = m.TotalElapsed - m.TimeToFirstToken;
-            var genTps = genTime.TotalSeconds > 0.001 ? m.CompletionTokens / genTime.TotalSeconds : 0;
+            // Prefer llama.cpp's server-reported decode rate; fall back to wall-clock if absent.
+            var genTps = m.GenTokensPerSecond > 0
+                ? m.GenTokensPerSecond
+                : (genTime.TotalSeconds > 0.001 ? m.CompletionTokens / genTime.TotalSeconds : 0);
             footer = $"TTFT {m.TimeToFirstToken.TotalSeconds:F1}s · gen {genTps:F0}/s · {m.CompletionTokens} tok · {m.TotalElapsed.TotalSeconds:F1}s";
         }
         else
@@ -580,64 +747,130 @@ internal sealed partial class AnsiPainter(AppConfig config, SessionState session
         {
             Footer = footer
         });
+        _autoScroll = true;
+        _scrollOffset = 0;
         Paint();
     }
 
-    internal void AppendThinking(string text)
+    internal void AppendThinking(string text) => AppendThinking(text, null);
+
+    internal void AppendThinking(string text, string? agentLabel)
     {
-        lock (_thinkingBufLock) { _thinkingBuf.Append(text); }
-        if (_thinking.Length == 0)
-        {
-            _thinking = "Thinking";
-            _thinkingFrame = 0;
-            _thinkingTimer?.Dispose();
-            _thinkingTimer = new System.Threading.Timer(_ =>
-            {
-                System.Threading.Interlocked.Increment(ref _thinkingFrame);
-                if (_paintActive)
-                    _paintChannel.Writer.TryWrite(new PaintRequest(PaintKind.Conv));
-            }, null, dueTime: 280, period: 280);
-        }
+        var key = agentLabel ?? MainAgentKey;
+        var stream = _thinkingStreams.GetOrAdd(key, _ => new ThinkingStream());
+        var wasActive = stream.Mode is "Thinking" or "Waiting";
+        lock (stream.BufferLock) { stream.Buffer.Append(text); }
+        stream.Mode = "Thinking";
+        stream.Collapsed = false;
+        System.Threading.Interlocked.Exchange(ref stream.LastActivityTick, DateTime.UtcNow.Ticks);
+        if (!wasActive) { _autoScroll = true; _scrollOffset = 0; }
+        EnsureThinkingTimer();
         PaintConvThrottled(force: false);
     }
 
-    internal void CollapseThinking(int charCount)
+    internal void CollapseThinking(int charCount) => CollapseThinking(charCount, null);
+
+    internal void CollapseThinking(int charCount, string? agentLabel)
     {
-        _thinkingCollapsed = true;
-        _thinkingCollapseChars = charCount;
-        _thinking = "";
-        _thinkingTimer?.Dispose();
-        _thinkingTimer = null;
-        lock (_thinkingBufLock) { _thinkingBuf.Clear(); }
+        var key = agentLabel ?? MainAgentKey;
+        if (!_thinkingStreams.TryGetValue(key, out var stream)) return;
+        stream.Collapsed = true;
+        stream.CollapseChars = charCount;
+        stream.Mode = "";
+        lock (stream.BufferLock) { stream.Buffer.Clear(); }
+        StopThinkingTimerIfIdle();
         PaintConvThrottled(force: true);
     }
 
-    internal void ShowWaitingIndicator()
+    internal void ShowWaitingIndicator(string? label = null) => ShowWaitingIndicator(label, null);
+
+    internal void ShowWaitingIndicator(string? label, string? agentLabel)
     {
-        if (_thinking.Length == 0)
+        var key = agentLabel ?? MainAgentKey;
+        var stream = _thinkingStreams.GetOrAdd(key, _ => new ThinkingStream());
+        stream.WaitingLabel = string.IsNullOrEmpty(label) ? "Thinking" : label;
+        if (stream.Mode != "Waiting")
         {
-            _thinking = "Waiting";
-            _thinkingFrame = 0;
-            _thinkingTimer?.Dispose();
-            _thinkingTimer = new System.Threading.Timer(_ =>
-            {
-                System.Threading.Interlocked.Increment(ref _thinkingFrame);
-                if (_paintActive)
-                    _paintChannel.Writer.TryWrite(new PaintRequest(PaintKind.Conv));
-            }, null, dueTime: 280, period: 280);
-            PaintConvThrottled(force: true);
+            stream.Mode = "Waiting";
+            stream.Frame = 0;
+            _autoScroll = true;
+            _scrollOffset = 0;
+        }
+        EnsureThinkingTimer();
+        PaintConvThrottled(force: true);
+    }
+
+    internal void ClearWaitingIndicator() => ClearWaitingIndicator(null);
+
+    internal void ClearWaitingIndicator(string? agentLabel)
+    {
+        var key = agentLabel ?? MainAgentKey;
+        if (!_thinkingStreams.TryGetValue(key, out var stream)) return;
+        if (stream.Mode == "Waiting")
+        {
+            stream.WaitingLabel = "Thinking";
+            ClearThinkingForKey(key);
         }
     }
 
-    internal void ClearWaitingIndicator()
+    internal void ShowToolProgress(string label)
     {
-        if (_thinking == "Waiting")
-            ClearThinking();
+        _toolProgress = label;
+        System.Threading.Interlocked.Increment(ref _toolProgressFrame);
+        PaintConvThrottled(force: false);
+    }
+
+    internal void ClearToolProgress()
+    {
+        if (_toolProgress is null) return;
+        _toolProgress = null;
+        PaintConvThrottled(force: true);
+    }
+
+    private void EnsureThinkingTimer()
+    {
+        lock (_thinkingTimerLock)
+        {
+            if (_thinkingTimer is not null) return;
+            _thinkingTimer = new System.Threading.Timer(_ =>
+            {
+                foreach (var s in _thinkingStreams.Values)
+                    System.Threading.Interlocked.Increment(ref s.Frame);
+                if (_paintActive)
+                    _paintChannel.Writer.TryWrite(new PaintRequest(PaintKind.Conv));
+            }, null, dueTime: 280, period: 280);
+        }
+    }
+
+    private void StopThinkingTimerIfIdle()
+    {
+        var anyActive = false;
+        foreach (var s in _thinkingStreams.Values)
+            if (s.Mode.Length > 0) { anyActive = true; break; }
+        if (anyActive) return;
+        lock (_thinkingTimerLock)
+        {
+            _thinkingTimer?.Dispose();
+            _thinkingTimer = null;
+        }
+    }
+
+    private void ClearThinkingForKey(string key)
+    {
+        if (_thinkingStreams.TryRemove(key, out var stream))
+        {
+            stream.Mode = "";
+            stream.Collapsed = false;
+            stream.CollapseChars = 0;
+            lock (stream.BufferLock) { stream.Buffer.Clear(); }
+        }
+        StopThinkingTimerIfIdle();
     }
 
     internal void ClearStreaming()
     {
         _streaming = false;
+        _toolProgress = null;
         lock (_streamLock) { _streamBuf.Clear(); }
         _ctrlCBannerVisible = false;
         _ctrlCBannerTimer?.Dispose();
@@ -646,12 +879,19 @@ internal sealed partial class AnsiPainter(AppConfig config, SessionState session
 
     internal void ClearThinking()
     {
-        _thinking = "";
-        _thinkingCollapsed = false;
-        _thinkingCollapseChars = 0;
-        _thinkingTimer?.Dispose();
-        _thinkingTimer = null;
-        lock (_thinkingBufLock) { _thinkingBuf.Clear(); }
+        foreach (var stream in _thinkingStreams.Values)
+        {
+            stream.Mode = "";
+            stream.Collapsed = false;
+            stream.CollapseChars = 0;
+            lock (stream.BufferLock) { stream.Buffer.Clear(); }
+        }
+        _thinkingStreams.Clear();
+        lock (_thinkingTimerLock)
+        {
+            _thinkingTimer?.Dispose();
+            _thinkingTimer = null;
+        }
     }
 
     internal void WriteMarkdown(string md)
@@ -774,7 +1014,7 @@ internal sealed partial class AnsiPainter(AppConfig config, SessionState session
     {
         lock (_messagesLock) { _messages.Clear(); _lastUserText = ""; }
         lock (_streamLock) { _streamBuf.Clear(); }
-        _thinking = "";
+        ClearThinking();
         _lastTokSec = 0;
         Array.Clear(_tokSecHistory);
         _tokSecHistoryIdx = 0;
@@ -901,6 +1141,10 @@ internal sealed partial class AnsiPainter(AppConfig config, SessionState session
             if (_contextWarningPct > 0) PaintContextWarning(sb);
 
             sb.Append(R);
+            AppendLaneOverlay(sb);
+            AppendAtOverlay(sb);
+            AppendSuggestionOverlay(sb);
+            AppendInputCursor(sb, mainW);
             W(sb.ToString());
             Flush();
         }
@@ -924,11 +1168,17 @@ internal sealed partial class AnsiPainter(AppConfig config, SessionState session
         var currentText = _getBgInput();
         var convH       = _th - InputContentRows(currentText, mainW) - 4;
         PaintConvArea(sb, mainW, convH);
+        PaintInputBox(sb, mainW, convH);
+        PaintTabBar(sb, mainW, convH + InputContentRows(currentText, mainW) + 2);
         PaintSidebar(sb, mainW, _th - 1);
         PaintStatusBar(sb);
         if (_ctrlCBannerVisible) PaintCtrlCBanner(sb);
         if (_contextWarningPct > 0) PaintContextWarning(sb);
         sb.Append(R);
+        AppendLaneOverlay(sb);
+        AppendAtOverlay(sb);
+        AppendSuggestionOverlay(sb);
+        AppendInputCursor(sb, mainW);
         W(sb.ToString());
         Flush();
         _paintInProgress = false;
@@ -957,6 +1207,7 @@ internal sealed partial class AnsiPainter(AppConfig config, SessionState session
     {
         try
         {
+            _inputCursor = cursor;
             Sz();
             var mainW       = Math.Max(1, _tw - _sideW);
             var wrapW       = InputWrapWidth(mainW);
@@ -1010,6 +1261,9 @@ internal sealed partial class AnsiPainter(AppConfig config, SessionState session
                 for (var row = oldFirstContent - 1; row < firstContentRow - 1; row++)
                     sb.Append($"{E}[{Math.Max(1, row + 1)};1H{BgMain}{new string(' ', mainW)}{R}");
                 sb.Append($"{E}[{Math.Max(1, firstContentRow - 1)};1H{divider}");
+
+                _prevConvFrame = null;
+                if (_paintActive) _paintChannel.Writer.TryWrite(new PaintRequest(PaintKind.Full));
             }
             else if (prevRows > 0 && contentRows > prevRows)
             {
@@ -1028,7 +1282,7 @@ internal sealed partial class AnsiPainter(AppConfig config, SessionState session
                 sb.Append(R);
             }
 
-            sb.Append($"{E}[{Math.Max(1, firstContentRow + cursorRow)};{3 + cursorCol}H");
+            sb.Append($"{E}[{Math.Max(1, firstContentRow + cursorRow)};{3 + cursorCol}H{E}[?25h");
             W(sb.ToString());
             Flush();
         }
@@ -1036,6 +1290,46 @@ internal sealed partial class AnsiPainter(AppConfig config, SessionState session
         {
             Log.Error("DoDrawInputText failed", ex);
         }
+    }
+
+    private void AppendInputCursor(StringBuilder sb, int mainW)
+    {
+        var text        = _getBgInput();
+        var wrapW       = InputWrapWidth(mainW);
+        var wrapped     = WrapInput(text, wrapW);
+        var contentRows = Math.Clamp(wrapped.Length, 1, 5);
+        var firstContentRow = Math.Max(1, _th - contentRows - 2);
+        var cursor      = _inputCursor;
+
+        int cursorRow, cursorCol;
+        if (wrapped.Length == 1 && wrapped[0].EndsWith("Copied]"))
+        {
+            cursorRow = 0;
+            cursorCol = wrapped[0].Length;
+        }
+        else if (wrapped.Length > 1 && wrapped[0].EndsWith("Copied]"))
+        {
+            var lastNl = text.LastIndexOf('\n');
+            if (cursor > lastNl)
+            {
+                var tailCursor = cursor - lastNl - 1;
+                cursorRow = 1 + (tailCursor / wrapW);
+                cursorCol = tailCursor % wrapW;
+                if (cursorRow >= contentRows)
+                {
+                    cursorRow = contentRows - 1;
+                    cursorCol = wrapped[cursorRow].Length;
+                }
+            }
+            else { cursorRow = 0; cursorCol = wrapped[0].Length; }
+        }
+        else
+        {
+            (cursorRow, cursorCol) = ComputeInputCursorPos(text, cursor, wrapW);
+            cursorRow = Math.Min(cursorRow, contentRows - 1);
+        }
+
+        sb.Append($"{E}[{Math.Max(1, firstContentRow + cursorRow)};{3 + cursorCol}H{E}[?25h");
     }
 
     private static (int row, int col) ComputeInputCursorPos(string text, int cursor, int wrapW)
@@ -1115,30 +1409,51 @@ internal sealed partial class AnsiPainter(AppConfig config, SessionState session
             for (var i = skip; i < wrapped.Count; i++)
                 lines.Add($"  {wrapped[i]}");
         }
-        else if (_thinkingCollapsed)
+        else
         {
-            var approxTok = _thinkingCollapseChars / 4;
-            var tok = approxTok > 0 ? $" [{approxTok} tok]" : "";
-            lines.Add("");
-            lines.Add($"  {Fk}◈ Thinking{tok}{R}");
-        }
-        else if (_thinking.Length > 0)
-        {
-            var frame   = System.Threading.Volatile.Read(ref _thinkingFrame);
-            var spinner = SpinnerFrames[frame % SpinnerFrames.Length];
-            var dots    = DotsFrames[frame % DotsFrames.Length];
-            lines.Add($"  {Fbb}{spinner} {IT}{Fk}Thinking{dots}");
-            string snapshot;
-            lock (_thinkingBufLock) { snapshot = _thinkingBuf.ToString(); }
-            if (snapshot.Length > 0)
+            var snapshotKeys = _thinkingStreams.Keys.OrderBy(k => k == MainAgentKey ? "" : k, StringComparer.Ordinal).ToList();
+            var firstBlock = true;
+            foreach (var key in snapshotKeys)
             {
-                var thinkLines = snapshot.Split('\n').Where(l => l.Length > 0).TakeLast(3).ToArray();
-                foreach (var ln in thinkLines)
+                if (!_thinkingStreams.TryGetValue(key, out var stream)) continue;
+                var who = key == MainAgentKey ? null : key;
+                var prefix = who is null ? "" : $"[{who}] ";
+                if (stream.Collapsed)
                 {
-                    var display = ln.Length > w - 6 ? ln[..(w - 6)] + "…" : ln;
-                    lines.Add($"  {IT}{Fk}{display}");
+                    var approxTok = stream.CollapseChars / 4;
+                    var tok = approxTok > 0 ? $" [{approxTok} tok]" : "";
+                    if (firstBlock) { lines.Add(""); firstBlock = false; }
+                    lines.Add($"  {Fk}◈ {prefix}Thinking{tok}{R}");
+                    continue;
+                }
+                if (stream.Mode.Length == 0) continue;
+                var frame   = System.Threading.Volatile.Read(ref stream.Frame);
+                var spinner = SpinnerFrames[frame % SpinnerFrames.Length];
+                var dots    = DotsFrames[frame % DotsFrames.Length];
+                var label   = stream.Mode == "Waiting" ? stream.WaitingLabel : "Thinking";
+                if (firstBlock) { lines.Add(""); firstBlock = false; }
+                lines.Add($"  {Fbb}{spinner} {IT}{Fk}{prefix}{label}{dots}");
+                string snapshot;
+                lock (stream.BufferLock) { snapshot = stream.Buffer.ToString(); }
+                if (snapshot.Length > 0)
+                {
+                    var perAgentLines = snapshotKeys.Count > 1 ? 1 : 3;
+                    var thinkLines = snapshot.Split('\n').Where(l => l.Length > 0).TakeLast(perAgentLines).ToArray();
+                    foreach (var ln in thinkLines)
+                    {
+                        var display = ln.Length > w - 6 ? ln[..(w - 6)] + "…" : ln;
+                        lines.Add($"  {IT}{Fk}{display}");
+                    }
                 }
             }
+        }
+
+        var toolProg = _toolProgress;
+        if (toolProg is not null)
+        {
+            var spinner = SpinnerFrames[Math.Abs(_toolProgressFrame) % SpinnerFrames.Length];
+            lines.Add("");
+            lines.Add($"  {Fbb}{spinner} {IT}{Fk}{toolProg}…{R}");
         }
 
         lock (_queueLock)
@@ -1164,18 +1479,30 @@ internal sealed partial class AnsiPainter(AppConfig config, SessionState session
 
         var safeH = Math.Max(1, h);
         if (_prevConvFrame is null || _prevConvFrame.Length < safeH)
-        {
-            _prevConvFrame     = new string[safeH];
-            _prevFrameWidth    = w;
-            _prevFrameHeight   = h;
-        }
+            _prevConvFrame = new string[safeH];
+        if (_rowPlainText.Length < safeH)
+            _rowPlainText = new string[safeH];
+
+        var selActive = _selAnchorRow >= 0;
+        var (ssr, ssc, ser, sec) = selActive ? NormalizedSelection() : (-1, 0, -1, 0);
 
         for (var row = 0; row < h; row++)
         {
             var idx = start + row;
             string newContent;
             var safeW = Math.Max(0, w);
-            if (idx < lines.Count)
+            var plain = idx < lines.Count ? AnsiRe.Replace(lines[idx], "") : "";
+            if (row < _rowPlainText.Length) _rowPlainText[row] = plain;
+
+            if (selActive && row >= ssr && row <= ser)
+            {
+                var from = row == ssr ? Math.Clamp(ssc, 0, plain.Length) : 0;
+                var to   = row == ser ? Math.Clamp(sec, 0, plain.Length) : plain.Length;
+                if (to < from) (from, to) = (to, from);
+                var content = $"{plain[..from]}{E}[7m{plain[from..to]}{E}[27m{plain[to..]}";
+                newContent = $"{BgMain} {PadR(content, Math.Max(0, safeW - 1))}{R}";
+            }
+            else if (idx < lines.Count)
                 newContent = $"{BgMain} {PadR(lines[idx], Math.Max(0, safeW - 1))}{R}";
             else
                 newContent = $"{BgMain}{new string(' ', safeW)}{R}";
@@ -1187,6 +1514,23 @@ internal sealed partial class AnsiPainter(AppConfig config, SessionState session
                 _prevConvFrame[row] = newContent;
             }
         }
+
+        if (_prevFrameHeight > h)
+        {
+            var blankLine = $"{BgMain}{new string(' ', Math.Max(0, w))}{R}";
+            for (var row = h; row < _prevFrameHeight && row < _prevConvFrame.Length; row++)
+            {
+                if (_prevConvFrame[row] != blankLine)
+                {
+                    sb.Append($"{E}[{row + 1};1H");
+                    sb.Append(blankLine);
+                    _prevConvFrame[row] = blankLine;
+                }
+            }
+        }
+
+        _prevFrameWidth  = w;
+        _prevFrameHeight = h;
 
         if (lines.Count > extraStart)
             lines.RemoveRange(extraStart, lines.Count - extraStart);
@@ -1301,6 +1645,16 @@ internal sealed partial class AnsiPainter(AppConfig config, SessionState session
 
     private void PaintStatusBar(StringBuilder sb)
     {
+        if (_toast is not null && DateTime.UtcNow < _toastExpiry)
+        {
+            var toast = $" {B}{Fbb}✓ {_toast}{R}{BgStatus}";
+            sb.Append($"{E}[?7l{E}[{_th};1H{E}[2K{BgStatus}");
+            sb.Append(toast);
+            sb.Append(new string(' ', Math.Max(0, _tw - VisLen(toast))));
+            sb.Append($"{R}{E}[?7h");
+            return;
+        }
+
         sb.Append($"{E}[?7l{E}[{_th};1H{E}[2K{BgStatus}");
         var tracker = session.Meta.TokenTracker;
         var tok     = tracker?.LastPromptTokens ?? 0;
@@ -1313,7 +1667,14 @@ internal sealed partial class AnsiPainter(AppConfig config, SessionState session
             _heartbeatFrame = (_heartbeatFrame + 1) % HeartbeatFrames.Length;
             _lastHeartbeatTick = now;
         }
-        var pulse = HeartbeatFrames[_heartbeatFrame];
+        var isCompacting = session.Meta.IsCompacting;
+        // Distinct glyph + color while compacting so the ring reads as "actively recalculating",
+        // not just the normal idle pulse — the (pct%) next to it is stale until compaction finishes.
+        var pulse = isCompacting
+            ? SpinnerFrames[_heartbeatFrame % SpinnerFrames.Length]
+            : HeartbeatFrames[_heartbeatFrame];
+        var pulseColor = isCompacting ? Fy : (_streaming && _lastTokSec > 0 ? Fc : Fg);
+        var compactingTag = isCompacting ? $"{Fy} compacting…{R}{BgStatus}" : "";
 
         var tokStr = FmtTok(tok);
         var wMax   = Volatile.Read(ref _windowMax);
@@ -1324,9 +1685,9 @@ internal sealed partial class AnsiPainter(AppConfig config, SessionState session
 
         string left;
         if (_streaming && _lastTokSec > 0)
-            left = $" {Fc}{pulse}{R}{BgStatus} {tokStr} ({pct}%){maxAvgStr}  {Fg}●{R}{BgStatus} {Fw}{_lastTokSec:F1} tok/s{R}{BgStatus}";
+            left = $" {pulseColor}{pulse}{R}{BgStatus} {tokStr} ({pct}%){compactingTag}{maxAvgStr}  {Fg}●{R}{BgStatus} {Fw}{_lastTokSec:F1} tok/s{R}{BgStatus}";
         else
-            left = $" {Fg}{pulse}{R}{BgStatus} {tokStr} ({pct}%){maxAvgStr}";
+            left = $" {pulseColor}{pulse}{R}{BgStatus} {tokStr} ({pct}%){compactingTag}{maxAvgStr}";
 
         sb.Append(left);
         var visL = VisLen(left);
@@ -1336,7 +1697,10 @@ internal sealed partial class AnsiPainter(AppConfig config, SessionState session
             : "";
         var canCancel = _isTurnActive() || QueuedCount > 0;
         var cancelHint = canCancel ? $"{Fk}esc{R}{BgStatus} {Fw}cancel{R}{BgStatus}" : "";
-        var mid   = $"{scrollIndicator}{cancelHint}";
+        var modeIndicator = session.Meta.PlanMode
+            ? $"{Fk}[{R}{Fy}PLAN{R}{Fk}]{R}{BgStatus} "
+            : $"{Fk}[{R}{Fg}BUILD{R}{Fk}]{R}{BgStatus} ";
+        var mid   = $"{modeIndicator}{scrollIndicator}{cancelHint}";
         var right = $"{Fk}ctrl+c{R}{BgStatus} {Fw}quit{R}{BgStatus}   {Fk}ctrl+p{R}{BgStatus} {Fw}commands{R}{BgStatus} ";
         var visM  = VisLen(mid);
         var visR  = VisLen(right);
@@ -1458,19 +1822,8 @@ internal sealed partial class AnsiPainter(AppConfig config, SessionState session
             {
                 lines.Add("");
                 var mdLines = AnsiMarkdown.Render(m.Text, w - 4);
-                const int maxLines  = 50;
-                const int keepLines = 45;
-                if (mdLines.Count > maxLines)
-                {
-                    for (var i = 0; i < keepLines; i++)
-                        lines.Add($"  {Fk}│{R} {mdLines[i]}");
-                    lines.Add($"  {Fk}│{R} {DM}{Fk}... ({mdLines.Count - keepLines} more lines){R}");
-                }
-                else
-                {
-                    foreach (var l in mdLines)
-                        lines.Add($"  {Fk}│{R} {l}");
-                }
+                foreach (var l in mdLines)
+                    lines.Add($"  {Fk}│{R} {l}");
                 if (m.Footer is not null)
                     lines.Add($"  {Fbb}■{R}  {Fk}{m.Footer}{R}");
                 break;

@@ -61,7 +61,7 @@ public sealed class AcpEndpointsTests : IAsyncLifetime
         services.AddSingleton<ILiveFeedback>(renderer);
 
         services.AddSingleton(sp => new AcpSessionStore(sp.GetRequiredService<AppConfig>(), sp.GetRequiredService<AcpServerSettings>(), startReaper: false));
-        services.AddSingleton(sp => new AcpLockFileWriter(sp.GetRequiredService<AcpServerSettings>(), _tempDir));
+        services.AddSingleton(sp => new AcpLockFileWriter(sp.GetRequiredService<AcpServerSettings>(), "/workspace"));
         services.AddSingleton(sp => new ConversationLoopFactory(
             sp.GetRequiredService<ILlmClient>(),
             sp.GetRequiredService<ToolRegistry>(),
@@ -166,7 +166,7 @@ public sealed class AcpEndpointsTests : IAsyncLifetime
         root.GetProperty("session_id").GetString().Should().Be(sid);
         root.GetProperty("model").GetString().Should().Be("test-model");
         root.GetProperty("turn_count").GetInt32().Should().Be(0);
-        root.GetProperty("plan_mode").GetBoolean().Should().BeFalse();
+        root.GetProperty("plan_mode").GetBoolean().Should().BeTrue("new sessions default to plan mode (read-only)");
     }
 
 
@@ -300,6 +300,34 @@ public sealed class AcpEndpointsTests : IAsyncLifetime
     }
 
 
+
+    [Fact]
+    public async Task GetSessions_lists_workspace_sessions_with_digests()
+    {
+        var sid1 = await CreateSessionAsync();
+        var store = _app.Services.GetRequiredService<AcpSessionStore>();
+        var s1 = store.TryGet(sid1)!;
+        s1.Messages.Add(new Message { Role = MessageRole.User, Content = "Fix the parser bug" });
+        s1.TurnCount = 1;
+        store.Save(s1);
+
+        await CreateSessionAsync();
+
+        var res = await _client.GetAsync("/api/v1/sessions");
+        res.StatusCode.Should().Be(HttpStatusCode.OK);
+
+        using var doc = JsonDocument.Parse(await res.Content.ReadAsStringAsync());
+        var sessions = doc.RootElement.GetProperty("sessions").EnumerateArray().ToArray();
+        sessions.Length.Should().BeGreaterThanOrEqualTo(2);
+
+        var first = sessions.Single(e => e.GetProperty("session_id").GetString() == sid1);
+        first.GetProperty("title").GetString().Should().Be("Fix the parser bug");
+        first.GetProperty("turn_count").GetInt32().Should().Be(1);
+        first.GetProperty("model").GetString().Should().Be("test-model");
+        first.GetProperty("message_count").GetInt32().Should().BeGreaterThanOrEqualTo(1);
+        first.GetProperty("started_at").GetString().Should().NotBeNullOrEmpty();
+        first.GetProperty("last_activity_at").GetString().Should().NotBeNullOrEmpty();
+    }
 
     private async Task<string> CreateSessionAsync()
     {

@@ -40,7 +40,7 @@ public class FileReadToolTests : IDisposable
     [Fact]
     public async Task ReadNonExistentFile_ReturnsError()
     {
-        var input = JsonDocument.Parse("""{"file_path": "/nonexistent/file.txt"}""").RootElement;
+        var input = JsonDocument.Parse("""{"file_path": "nonexistent.txt"}""").RootElement;
         var result = await _tool.ExecuteAsync(input, _context, CancellationToken.None);
 
         result.IsError.Should().BeTrue();

@@ -1,38 +1,46 @@
 using OpenMono.Session;
-using OpenMono.Tools;
 
 namespace OpenMono.Commands;
 
 public sealed class PlanCommand : ICommand
 {
+    private readonly ConversationLoop _loop;
+
+    public PlanCommand(ConversationLoop loop) => _loop = loop;
+
     public string Name => "plan";
-    public string Description => "Toggle plan mode — restricts agent to read-only tools for safe exploration.";
+    public string Description => "Enter Plan mode (read-only); '/plan <task>' plans a task right away";
     public CommandType Type => CommandType.Local;
 
-    public Task ExecuteAsync(string[] args, CommandContext context, CancellationToken ct)
+    public async Task ExecuteAsync(string[] args, CommandContext context, CancellationToken ct)
     {
-        context.Session.Meta.PlanMode = !context.Session.Meta.PlanMode;
+        var session = context.Session;
+        var task = args.Length > 0 ? string.Join(' ', args).Trim() : "";
 
-        if (context.Session.Meta.PlanMode)
-        {
-            context.Session.AddMessage(new Message
+        var wasPlanMode = session.Meta.PlanMode;
+        session.Meta.PlanMode = true;
+
+        // Notice in the conversation so the agent registers the switch on its next turn.
+        if (!wasPlanMode)
+            session.AddMessage(new Message
             {
                 Role = MessageRole.User,
-                Content = PlanModeInstructions.Activation("activated by user via /plan"),
+                Content = ModeInstructions.SwitchedToPlan,
             });
-            context.Renderer.WriteInfo("Plan mode ON — agent is restricted to read-only tools.");
-            context.Renderer.WriteInfo("Use /plan again or call ExitPlanMode to resume full access.");
-        }
-        else
-        {
-            context.Session.AddMessage(new Message
-            {
-                Role = MessageRole.User,
-                Content = PlanModeInstructions.Deactivation,
-            });
-            context.Renderer.WriteInfo("Plan mode OFF — all tools available.");
-        }
 
-        return Task.CompletedTask;
+        context.Renderer.WriteInfo(
+            "✓ Plan mode — read-only. I'll investigate and present a plan for your approval before any changes.");
+
+        if (task.Length == 0)
+            return;
+
+        // Drive a planning turn immediately: investigate, then present via CreatePlan (which
+        // renders the plan to the user). The agent stays in Plan mode until the user approves.
+        var instruction =
+            $"{task}\n\n" +
+            "[Plan this task: investigate as needed, then call CreatePlan to present a numbered " +
+            "implementation plan for my approval. Do not implement anything yet.]";
+
+        await _loop.RunTurnAsync(instruction, null, ct);
     }
 }

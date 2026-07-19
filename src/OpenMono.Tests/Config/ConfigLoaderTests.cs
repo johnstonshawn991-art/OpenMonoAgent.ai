@@ -25,6 +25,28 @@ public class ConfigLoaderTests : IDisposable
     }
 
     [Fact]
+    public void Load_ResolvesNonCanonicalWorkingDirectoryToAnAbsolutePath()
+    {
+        var sub = Path.Combine(_tempDir, "sub");
+        Directory.CreateDirectory(sub);
+        var nonCanonical = Path.Combine(_tempDir, "sub", "..", "sub");
+
+        var config = ConfigLoader.Load(nonCanonical);
+
+        config.WorkingDirectory.Should().Be(Path.GetFullPath(sub));
+        config.WorkingDirectory.Should().NotContain("..");
+    }
+
+    [Fact]
+    public void Load_ResolvesRelativeWorkingDirectoryAgainstCurrentDirectory()
+    {
+        var config = ConfigLoader.Load(".");
+
+        Path.IsPathRooted(config.WorkingDirectory).Should().BeTrue();
+        config.WorkingDirectory.Should().Be(Path.GetFullPath("."));
+    }
+
+    [Fact]
     public void Load_MergesUserConfig()
     {
         var dataDir = Path.Combine(_tempDir, ".openmono");

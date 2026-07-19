@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # acp-smoke.sh — Docker-based end-to-end smoke test for the OpenMono ACP agent.
 #
-# Builds (or assumes) the openmono/agent:dev image, launches a container with the
+# Builds (or assumes) the openmono/agent:latest image, launches a container with the
 # current working tree mounted at /workspace, then asserts:
 #   - GET /api/v1/discovery returns 200 and the host_workspace matches $PWD
 #   - <workspace>/.openmono/agent.lock appears with the right port
@@ -13,13 +13,13 @@
 #   public/scripts/acp-smoke.sh
 #
 # Env:
-#   OPENMONO_IMAGE   image tag to use (default: openmono/agent:dev)
+#   OPENMONO_IMAGE   image tag to use (default: openmono/agent:latest)
 #   ACP_PORT         override the picked host port (default: ephemeral)
 
 set -euo pipefail
 
 WORKSPACE="${PWD}"
-IMAGE="${OPENMONO_IMAGE:-openmono/agent:dev}"
+IMAGE="${OPENMONO_IMAGE:-openmono/agent:latest}"
 
 if ! command -v docker >/dev/null 2>&1; then
   echo "docker is not on PATH" >&2

@@ -40,8 +40,8 @@ public sealed class AcpLockFileWriter
             ?? throw new InvalidOperationException(
                 "HOST_WORKSPACE_PATH env var is required. The extension's DockerManager " +
                 "always sets it; a user-managed docker-compose setup must declare it too.");
-        var agentId = Environment.GetEnvironmentVariable("ACP_AGENT_ID") ?? GenerateAgentId();
-        var containerId = Environment.GetEnvironmentVariable("HOSTNAME") ?? "unknown";
+        var agentId = Environment.GetEnvironmentVariable("ACP_AGENT_ID") ?? GenerateAgentId(hostWorkspace);
+        var containerId = Environment.GetEnvironmentVariable("HOSTNAME") ?? Environment.MachineName;
 
         _payload = new LockPayload(
             version: "1.0.0",
@@ -98,8 +98,10 @@ public sealed class AcpLockFileWriter
         string container_id,
         string started_at);
 
-    private static string GenerateAgentId()
-        => "agt_" + Convert.ToHexString(Guid.NewGuid().ToByteArray())[..12].ToLowerInvariant();
+    private static string GenerateAgentId(string hostWorkspace)
+        => "agt_" + Convert.ToHexString(
+            System.Security.Cryptography.SHA256.HashData(
+                System.Text.Encoding.UTF8.GetBytes(hostWorkspace)))[..16].ToLowerInvariant();
 
     private static int ParseIntOrDefault(string? s, int @default)
         => int.TryParse(s, out var v) ? v : @default;
