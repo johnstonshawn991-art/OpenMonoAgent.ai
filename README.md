@@ -27,7 +27,7 @@
   <img src="https://img.shields.io/badge/docker-ready-2496ED?logo=docker&logoColor=white" alt="Docker" />
   <img src="https://img.shields.io/badge/llama.cpp-local%20inference-black?logo=llama&logoColor=white" alt="llama.cpp" />
   <img src="https://img.shields.io/badge/self--hosted-yes-brightgreen" alt="Self-hosted" />
-  <img src="https://img.shields.io/badge/platform-Linux-FCC624?logo=linux&logoColor=black" alt="Linux" />
+  <img src="https://img.shields.io/badge/platform-Linux%20%7C%20macOS-FCC624?logo=linux&logoColor=black" alt="Linux and macOS" />
 </div>
 
 ---
@@ -157,13 +157,14 @@ Local llama.cpp is the default and fully supported. OpenAI, Anthropic, and Ollam
 </tr>
 </table>
 
-> **09 · Distributed inference** — Agent on your laptop, inference on a separate GPU machine. Free relay at [app.openmonoagent.ai](https://app.openmonoagent.ai).
+> **09 · Distributed inference** — Agent on your laptop, inference on a separate GPU machine. Free relay at [app.openmonoagent.ai](https://app.openmonoagent.ai), or connect over [Tailscale](docs/SETUP.md#dual-box-via-tailscale).
 
 <div align="center">
   <img src="docs/assets/dual-box-server.png" alt="Distributed inference: agent on laptop, inference on GPU machine" width="680" />
 </div>
 
-→ [Dual-box setup guide](docs/SETUP.md#dual-box-setup) — tunnel setup, relay connection, troubleshooting
+→ [Dual-box setup guide](docs/SETUP.md#dual-box-setup) — frp relay, Tailscale, troubleshooting  
+→ [Dual-box security](docs/SECURITY.md) — API keys, Tailscale ACLs, bind host
 
 ---
 
@@ -175,9 +176,12 @@ Local llama.cpp is the default and fully supported. OpenAI, Anthropic, and Ollam
 | GPU 16 GB | Qwen3.6-27B-UD-IQ3_XXS | Lower | ~20–42 tok/s (4060 Ti → 4080) |
 | GPU 12 GB | Qwen3.5-9B-Q4_K_M | Lower | ~38–40 tok/s (RTX 3060) |
 | CPU 24 GB RAM | Qwen3.6-35B-A3B-UD-Q4_K_XL | Full | ~17–20 tok/s |
+| Apple Silicon 48 GB+ | Qwen3.6-35B-A3B-UD-Q4_K_XL | Standard | Metal, native llama.cpp |
+| Apple Silicon 32 GB | Qwen3.6-27B-UD-IQ3_XXS | Lower | Metal, native llama.cpp |
+| Apple Silicon 16 GB | Qwen3.5-9B-Q4_K_M | Lower | Metal, native llama.cpp |
 
 > [!NOTE]
-> The installer detects your hardware and selects the right model automatically — no config needed. 12 GB and 16 GB GPU cards are supported but run lower accuracy models. For best results, use a 24 GB card. Requires Ubuntu 26.04 LTS (recommended) or 25.10.
+> The installer detects your hardware and selects the right model automatically — no config needed. 12 GB and 16 GB GPU cards are supported but run lower accuracy models. For best results, use a 24 GB card. NVIDIA installs target Ubuntu 26.04 LTS (recommended) or 25.10. Apple Silicon uses the macOS installer and runs llama.cpp natively on Metal.
 
 ## Architecture
 
@@ -204,6 +208,7 @@ Settings load from `~/.openmono/settings.json` (user-level) or `.openmono/settin
 - [Architecture](docs/ARCHITECTURE.md) — .NET CLI + llama.cpp + Docker, full diagram
 - [Models & reasoning mode](docs/MODELS.md)
 - [Configuration](docs/CONFIG.md) — settings.json, providers, permissions, MCP servers
+- [Security (dual-box)](docs/SECURITY.md) — Tailscale, API keys, bind host, ACLs
 - [Tools](docs/ARCHITECTURE.md)
 - [Playbooks](docs/PLAYBOOKS.md)
 - [graphify](docs/graphify.md) — semantic code graph, 25+ languages

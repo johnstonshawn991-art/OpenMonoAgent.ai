@@ -6,7 +6,15 @@ set -eo pipefail
 # Usage: openmono <command>
 # ──────────────────────────────────────────────────────────────────────────────
 
-REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Resolve symlinks so /usr/local/bin/openmono still finds repo scripts/
+_OPENMONO_SRC="${BASH_SOURCE[0]}"
+while [[ -L "$_OPENMONO_SRC" ]]; do
+    _OPENMONO_DIR="$(cd "$(dirname "$_OPENMONO_SRC")" && pwd)"
+    _OPENMONO_SRC="$(readlink "$_OPENMONO_SRC")"
+    [[ "$_OPENMONO_SRC" != /* ]] && _OPENMONO_SRC="$_OPENMONO_DIR/$_OPENMONO_SRC"
+done
+REPO_DIR="$(cd "$(dirname "$_OPENMONO_SRC")" && pwd)"
+unset _OPENMONO_SRC _OPENMONO_DIR
 DOCKER_DIR="$REPO_DIR/docker"
 LLAMA_PORT="${LLAMA_PORT:-7474}"
 
@@ -21,6 +29,9 @@ NATIVE_INFERENCE=false
 if [[ "$NATIVE_INFERENCE" == "true" ]]; then
     source "$REPO_DIR/scripts/llama-native.sh"
 fi
+
+# shellcheck source=scripts/lib/tailscale-cli.sh
+source "$REPO_DIR/scripts/lib/tailscale-cli.sh"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -45,7 +56,17 @@ _ensure_docker() {
     warn "Docker daemon is not accessible. Attempting to start..."
 
     if [ "$_OS" = "Darwin" ]; then
-        # Try Docker Desktop first (if installed)
+        # Prefer Colima on agent Macs (often no Docker Desktop)
+        if command -v colima &>/dev/null; then
+            info "Starting Colima..."
+            if colima start 2>/dev/null; then
+                for i in $(seq 1 45); do
+                    docker info &>/dev/null 2>&1 && { ok "Docker is ready (Colima)"; return 0; }
+                    sleep 1
+                done
+            fi
+            warn "Colima did not become ready — trying Docker Desktop if present"
+        fi
         if [ -d "/Applications/Docker.app" ]; then
             info "Starting Docker Desktop..."
             open /Applications/Docker.app
@@ -60,15 +81,7 @@ _ensure_docker() {
             done
             echo ""
             err "Docker Desktop started but daemon is not accessible. Try: colima status"
-        # Fallback to Colima if Docker Desktop is not installed
         elif command -v colima &>/dev/null; then
-            info "Starting Colima..."
-            if colima start 2>/dev/null; then
-                for i in $(seq 1 15); do
-                    docker info &>/dev/null 2>&1 && { ok "Docker is ready"; return 0; }
-                    sleep 1
-                done
-            fi
             err "Colima failed to start. Try: colima status"
         else
             err "Neither Docker Desktop nor Colima is available. Try: openmono setup"
@@ -120,14 +133,16 @@ cmd_help() {
     printf "  %-14s %s\n" "logs"    "Tail llama-server logs"
     printf "  %-14s %s\n" "status"  "Show container + GPU + model status"
     echo ""
-    echo "Inference box (frpc tunnel to the relay — dual-box only):"
-    printf "  %-14s %s\n" "tunnel setup"      "Install frpc + systemd unit (prompts for relay signup values)"
+    echo "Inference box (dual-box tunnel — frp relay or Tailscale):"
+    printf "  %-14s %s\n" "tunnel setup"      "frp relay (default) or --tailscale for MagicDNS/100.x"
+    printf "  %-14s %s\n" "tunnel prepare"    "Dual-box readiness checklist (Mini + agent Mac)"
+    printf "  %-14s %s\n" "tunnel doctor"     "prepare + security probes (health + API key)"
     printf "  %-14s %s\n" "tunnel rotate-key" "Rotate LLAMA_API_KEY and restart llama-server"
-    printf "  %-14s %s\n" "tunnel start"      "Start the frpc tunnel"
-    printf "  %-14s %s\n" "tunnel stop"       "Stop the frpc tunnel"
-    printf "  %-14s %s\n" "tunnel restart"    "Restart the frpc tunnel"
-    printf "  %-14s %s\n" "tunnel status"     "Show tunnel state + configured target"
-    printf "  %-14s %s\n" "tunnel logs"       "Tail frpc logs (journalctl -u frpc)"
+    printf "  %-14s %s\n" "tunnel start"      "Start the frpc tunnel (frp only)"
+    printf "  %-14s %s\n" "tunnel stop"       "Stop the frpc tunnel (frp only)"
+    printf "  %-14s %s\n" "tunnel restart"    "Restart the frpc tunnel (frp only)"
+    printf "  %-14s %s\n" "tunnel status"     "Show frpc + Tailscale state / endpoints"
+    printf "  %-14s %s\n" "tunnel logs"       "Tail frpc logs (journalctl -u frpc; frp only)"
     echo ""
     echo "Global flags:"
     printf "  %-14s %s\n" "--verbose, -v" "Enable verbose/debug output (forwarded to the agent)"
@@ -194,9 +209,8 @@ cmd_setup() {
     done
 
     # Source shared logging helpers for role_prompt function
-    _REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
     # shellcheck source=scripts/lib/log.sh
-    source "$_REPO_DIR/scripts/lib/log.sh"
+    source "$REPO_DIR/scripts/lib/log.sh"
 
     # Interactive role prompt when no --full/--inference/--agent flag was given
     role_prompt
@@ -533,6 +547,36 @@ cmd_agent() {
     # Native (macOS) and Docker paths differ; remote/tunnel endpoints are skipped.
     local effective_endpoint="${OPENMONO_ENDPOINT:-http://llama-server:7474}"
     local local_health="http://localhost:${LLAMA_PORT}/health"
+    local cfg_key_check="${OPENMONO_API_KEY:-}"
+    local is_remote=false
+    if [[ -n "$effective_endpoint" ]] && \
+       [[ "$effective_endpoint" != "http://llama-server:7474" ]] && \
+       [[ "$effective_endpoint" != "http://localhost:${LLAMA_PORT}" ]] && \
+       [[ "$effective_endpoint" != "http://localhost:7474" ]] && \
+       [[ "$effective_endpoint" != "http://127.0.0.1:${LLAMA_PORT}" ]] && \
+       [[ "$effective_endpoint" != "http://127.0.0.1:7474" ]]; then
+        is_remote=true
+    fi
+
+    # Dual-box security: refuse empty / placeholder API keys for remote inference.
+    if [[ "$is_remote" == "true" ]]; then
+        local key_lc
+        key_lc="$(printf '%s' "$cfg_key_check" | tr '[:upper:]' '[:lower:]')"
+        if [[ -z "$cfg_key_check" ]] || \
+           [[ "$key_lc" == *"paste"* ]] || \
+           [[ "$key_lc" == *"your-api-key"* ]] || \
+           [[ "$key_lc" == *"changeme"* ]] || \
+           [[ "$cfg_key_check" == "abc123def456" ]]; then
+            err "Remote llm.endpoint is set but llm.api_key is missing or a placeholder."
+            err "Inference must require a real LLAMA_API_KEY (see docs/SECURITY.md)."
+            echo ""
+            echo "  On the inference box:  grep LLAMA_API_KEY docker/.env"
+            echo "  Or:  openmono tunnel setup --tailscale"
+            echo "  Then here:  openmono config set llm.api_key <key>"
+            echo "  Helper:     ./scripts/apply-mini-endpoint.sh <key>"
+            exit 1
+        fi
+    fi
 
     if [[ "$NATIVE_INFERENCE" == "true" ]]; then
         # macOS Apple Silicon — delegate to helper which auto-starts llama-server
@@ -776,12 +820,143 @@ tunnel_require_systemd() {
     fi
 }
 
+# Resolve a dual-box endpoint for rotate-key / status printing.
+# Prefers Tailscale cache, then relay.json.
+_tunnel_resolve_endpoint() {
+    local ts_cache="$HOME/.openmono/tailscale-tunnel.json"
+    local relay_cache="$HOME/.openmono/relay.json"
+    local endpoint=""
+
+    if [[ -f "$ts_cache" ]] && command -v jq &>/dev/null; then
+        endpoint="$(jq -r '.endpoint // empty' "$ts_cache" 2>/dev/null || true)"
+        # Refresh from live Tailscale if cache endpoint is stale/empty
+        if [[ -z "$endpoint" ]] && command -v tailscale &>/dev/null; then
+            local host port
+            host="$(jq -r '.hostname // .ip // empty' "$ts_cache" 2>/dev/null || true)"
+            port="$(jq -r '.port // 7474' "$ts_cache" 2>/dev/null || true)"
+            [[ -n "$host" ]] && endpoint="http://${host}:${port}"
+        fi
+    fi
+
+    if [[ -z "$endpoint" && -f "$relay_cache" ]] && command -v jq &>/dev/null; then
+        local frps_addr remote_port
+        frps_addr="$(jq -r '.frpsAddress // empty' "$relay_cache" 2>/dev/null)"
+        remote_port="$(jq -r '.remotePort // empty' "$relay_cache" 2>/dev/null)"
+        [[ -n "$frps_addr" && -n "$remote_port" ]] && \
+            endpoint="http://${frps_addr}:${remote_port}"
+    fi
+
+    printf '%s' "$endpoint"
+}
+
+_tunnel_print_tailscale_status() {
+    local ts_cache="$HOME/.openmono/tailscale-tunnel.json"
+
+    echo ""
+    echo -e "${BLUE}── Tailscale (dual-box) ─────────────────────────────${NC}"
+
+    if ! resolve_tailscale_cli; then
+        if [[ -f "$ts_cache" ]]; then
+            warn "tailscale CLI missing but cache exists: $ts_cache"
+        else
+            info "tailscale not installed (optional). Setup: openmono tunnel setup --tailscale"
+        fi
+        return 0
+    fi
+
+    local backend="" dns="" ip=""
+    backend="$(tailscale_backend_state 2>/dev/null || true)"
+    if [[ "$backend" == "Running" ]]; then
+        local st
+        st="$(tailscale_cmd status --json 2>/dev/null || true)"
+        dns="$(echo "$st" | jq -r '.Self.DNSName // empty' 2>/dev/null | sed 's/\.$//' || true)"
+        ip="$(tailscale_cmd ip -4 2>/dev/null | head -1 || true)"
+        ok "tailscale → Running ($TAILSCALE_BIN)"
+        [[ -n "$dns" ]] && info "MagicDNS = $dns"
+        [[ -n "$ip" ]] && info "IPv4 = $ip"
+        local port="${LLAMA_PORT:-7474}"
+        if [[ -f "$ts_cache" ]] && command -v jq &>/dev/null; then
+            port="$(jq -r '.port // 7474' "$ts_cache" 2>/dev/null || echo "$port")"
+            local cached
+            cached="$(jq -r '.endpoint // empty' "$ts_cache" 2>/dev/null || true)"
+            [[ -n "$cached" ]] && info "Cached endpoint: $cached"
+        fi
+        if [[ -n "$dns" ]]; then
+            info "Suggested endpoint: http://${dns}:${port}"
+        elif [[ -n "$ip" ]]; then
+            info "Suggested endpoint: http://${ip}:${port}"
+        fi
+    else
+        warn "tailscale → ${backend:-not connected} ($TAILSCALE_BIN)"
+        if [[ "$backend" == "NeedsLogin" || "$backend" == "PrefsError" || -z "$backend" ]]; then
+            tailscale_login_hint 2>&1 | while IFS= read -r line; do warn "$line"; done
+        elif [[ -f "$ts_cache" ]]; then
+            warn "Cache present: $ts_cache — re-run: openmono tunnel setup --tailscale"
+        else
+            info "Optional setup: openmono tunnel setup --tailscale"
+        fi
+    fi
+}
+
 cmd_tunnel() {
     local sub="${1:-help}"
     shift || true
     case "$sub" in
         setup)
-            bash "$REPO_DIR/scripts/setup-tunnel-inference.sh" "$@"
+            local use_tailscale=false
+            local setup_args=()
+            for arg in "$@"; do
+                case "$arg" in
+                    --tailscale) use_tailscale=true ;;
+                    *) setup_args+=("$arg") ;;
+                esac
+            done
+            if [[ "$use_tailscale" == "true" ]]; then
+                bash "$REPO_DIR/scripts/setup-tunnel-tailscale.sh" --tailscale "${setup_args[@]}"
+            else
+                bash "$REPO_DIR/scripts/setup-tunnel-inference.sh" "${setup_args[@]}"
+            fi
+            ;;
+        prepare)
+            bash "$REPO_DIR/scripts/prepare-dualbox-macos.sh" "$@"
+            ;;
+        doctor|secure-check)
+            # Decision: doctor = prepare + security probes (does not exit early on prepare fail)
+            local prep_rc=0
+            bash "$REPO_DIR/scripts/prepare-dualbox-macos.sh" "$@" || prep_rc=$?
+            echo ""
+            echo -e "${BLUE}── Security checklist ────────────────────────────────${NC}"
+            info "See docs/SECURITY.md"
+            if [[ -f "$HOME/.openmono/settings.json" ]] && command -v jq &>/dev/null; then
+                local ep key
+                ep="$(jq -r '.llm.endpoint // empty' "$HOME/.openmono/settings.json")"
+                key="$(jq -r '.llm.api_key // empty' "$HOME/.openmono/settings.json")"
+                if [[ -n "$ep" && "$ep" != http://localhost* && "$ep" != http://127.0.0.1* ]]; then
+                    if curl -sf --max-time 3 "${ep%/}/health" &>/dev/null; then
+                        ok "Remote health OK: $ep/health"
+                    else
+                        warn "Remote health failed: $ep/health (is Mini up + Tailscale Running?)"
+                    fi
+                    if [[ -z "$key" ]]; then
+                        warn "Missing llm.api_key — chat will 401 until set"
+                        info "Helper: ./scripts/secure-mini-ssh-and-key.sh"
+                        info "Then:   ./scripts/apply-mini-endpoint.sh <key>"
+                    else
+                        local code
+                        code="$(curl -s --max-time 5 -o /dev/null -w '%{http_code}' \
+                            -H "Authorization: Bearer ${key}" \
+                            -H 'Content-Type: application/json' \
+                            -d '{"model":"local","messages":[{"role":"user","content":"ping"}],"max_tokens":1}' \
+                            "${ep%/}/v1/chat/completions" 2>/dev/null || echo 000)"
+                        if [[ "$code" == "200" ]]; then
+                            ok "Authenticated chat probe → HTTP $code"
+                        else
+                            warn "Authenticated chat probe → HTTP ${code:-000} (rotate/copy key from Mini)"
+                        fi
+                    fi
+                fi
+            fi
+            return "$prep_rc"
             ;;
         start)
             tunnel_require_systemd
@@ -829,7 +1004,7 @@ cmd_tunnel() {
             fi
 
             echo ""
-            echo -e "${BLUE}── Configured target ────────────────────────────────${NC}"
+            echo -e "${BLUE}── Configured frp target ────────────────────────────${NC}"
             if [[ -f /etc/frp/frpc.toml ]]; then
                 local server_addr remote_port
                 server_addr="$(awk -F'"' '/^serverAddr/{print $2; exit}' /etc/frp/frpc.toml 2>/dev/null)"
@@ -842,6 +1017,8 @@ cmd_tunnel() {
             else
                 warn "/etc/frp/frpc.toml not found"
             fi
+
+            _tunnel_print_tailscale_status
             echo ""
             ;;
         logs)
@@ -853,7 +1030,6 @@ cmd_tunnel() {
                 native_cmd_tunnel_rotate_key
             else
                 local env_file="$REPO_DIR/docker/.env"
-                local relay_cache="$HOME/.openmono/relay.json"
 
                 if [[ ! -f "$env_file" ]]; then
                     err "docker/.env not found. Run 'openmono tunnel setup' first."
@@ -886,15 +1062,8 @@ cmd_tunnel() {
                     warn "docker compose not found — restart llama-server manually to enforce the new key"
                 fi
 
-                # Read endpoint from relay cache for convenience
-                local endpoint=""
-                if [[ -f "$relay_cache" ]]; then
-                    local frps_addr remote_port
-                    frps_addr="$(jq -r '.frpsAddress // empty' "$relay_cache" 2>/dev/null)"
-                    remote_port="$(jq -r '.remotePort // empty' "$relay_cache" 2>/dev/null)"
-                    [[ -n "$frps_addr" && -n "$remote_port" ]] && \
-                        endpoint="http://$frps_addr:$remote_port"
-                fi
+                local endpoint
+                endpoint="$(_tunnel_resolve_endpoint)"
 
                 echo ""
                 printf "${BLUE}%s${NC}\n" "$(printf '─%.0s' $(seq 1 60))"
@@ -912,22 +1081,30 @@ cmd_tunnel() {
         help|--help|-h|"")
             echo "Usage: openmono tunnel <subcommand>"
             echo ""
-            echo "Run on the inference box. Manages the frpc tunnel that dials your"
-            echo "openmonoagent relay. The tunnel runs as a systemd service (frpc.service)."
+            echo "Run on the inference box. Dual-box transports:"
+            echo "  • frp relay (default) — systemd service frpc.service"
+            echo "  • Tailscale           — MagicDNS / 100.x; own daemon (tailscaled)"
             echo ""
-            echo "  setup       Install frpc + systemd unit; prompts for your relay"
-            echo "              signup values (frpsAddress, relayToken, remotePort,"
-            echo "              proxyPrefix). Preserves existing LLAMA_API_KEY."
+            echo "  setup [--tailscale] [--auth-key tskey-auth-...]"
+            echo "              Default: install frpc + systemd unit for the"
+            echo "              openmonoagent relay. With --tailscale: join/reuse"
+            echo "              a Tailscale tailnet and print agent config."
+            echo "              Preserves existing LLAMA_API_KEY."
+            echo "  prepare [--inference|--agent]"
+            echo "              Dual-box readiness checklist (Wi-Fi + Tailscale)."
+            echo "              Auto-picks role: arm64 Mac → inference, else agent."
+            echo "  doctor      Same as prepare, plus health + API-key chat probe."
             echo "  rotate-key  Generate a new LLAMA_API_KEY and restart llama-server."
-            echo "              Use when credentials are compromised. Prints the config"
-            echo "              set commands for the agent box."
-            echo "  start       systemctl start frpc"
-            echo "  stop        systemctl stop frpc"
-            echo "  restart     systemctl restart frpc"
-            echo "  status      Show frpc.service state + configured target"
-            echo "  logs        journalctl -u frpc -f"
+            echo "              Prints config set commands for the agent box"
+            echo "              (Tailscale endpoint preferred over relay when both exist)."
+            echo "  start       systemctl start frpc          (frp only)"
+            echo "  stop        systemctl stop frpc           (frp only)"
+            echo "  restart     systemctl restart frpc        (frp only)"
+            echo "  status      Show frpc + Tailscale state / endpoints"
+            echo "  logs        journalctl -u frpc -f         (frp only)"
             echo ""
-            echo "Config file: /etc/frp/frpc.toml"
+            echo "frp config: /etc/frp/frpc.toml"
+            echo "Tailscale cache: ~/.openmono/tailscale-tunnel.json"
             ;;
         *)
             err "Unknown tunnel subcommand: $sub"

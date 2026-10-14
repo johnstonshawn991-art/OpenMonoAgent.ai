@@ -4,8 +4,9 @@
 
 | | |
 |--|--|
-| **OS** | Ubuntu 26.04 LTS (recommended) · 25.10 |
+| **OS** | Ubuntu 26.04 LTS (recommended) · 25.10 · macOS 14+ on Apple Silicon |
 | **GPU mode** | NVIDIA GPU · 12 GB VRAM minimum · 24 GB recommended |
+| **Mac inference** | Apple Silicon · Metal via Homebrew llama.cpp · 16 GB unified memory minimum |
 | **CPU mode** | 24 GB RAM |
 | **Disk** | ~20 GB free for the model download |
 
@@ -276,21 +277,7 @@ The agent on your laptop sends requests through the relay to the inference box.
 > [!NOTE]
 > Don't have a relay account? Sign up free at [app.openmonoagent.ai](https://app.openmonoagent.ai).
 
----
-
-### Tunnel commands (inference box)
-
-```bash
-openmono tunnel start    # start the frpc tunnel
-openmono tunnel stop     # stop the tunnel
-openmono tunnel restart  # restart
-openmono tunnel status   # show tunnel state + configured target
-openmono tunnel logs     # tail frpc logs
-```
-
----
-
-### Troubleshooting
+### Troubleshooting (relay and Tailscale)
 
 > [!CAUTION]
 > **401 Unauthorized** — the API key on your laptop doesn't match the one on the inference box.
@@ -307,6 +294,119 @@ openmono tunnel logs     # tail frpc logs
 > ```bash
 > openmono config set llm.api_key <value-from-inference-box>
 > ```
+
+---
+
+### Tunnel commands (inference box)
+
+```bash
+openmono tunnel setup              # frp relay (Linux/systemd)
+openmono tunnel setup --tailscale  # Tailscale MagicDNS / 100.x (macOS + Linux)
+openmono tunnel start              # start the frpc tunnel (frp only)
+openmono tunnel stop               # stop the tunnel (frp only)
+openmono tunnel restart            # restart (frp only)
+openmono tunnel status             # show frpc + Tailscale state / endpoints
+openmono tunnel logs               # tail frpc logs (frp only)
+```
+
+> [!NOTE]
+> `start` / `stop` / `restart` / `logs` apply only to the frp relay service. Tailscale is managed by its own daemon (`tailscaled`).
+
+---
+
+## Dual-box via Tailscale
+
+Use Tailscale instead of the OpenMonoAgent frp relay when both boxes are on the same tailnet. Works on **macOS and Linux** (no systemd required for the tunnel itself).
+
+### Step 1 — Install Tailscale on both boxes
+
+Install and join the **same** tailnet on the inference box and the agent box:
+
+- macOS: `brew install --cask tailscale` or [tailscale.com/download/mac](https://tailscale.com/download/mac)
+- Linux: `curl -fsSL https://tailscale.com/install.sh | sh` or [tailscale.com/download/linux](https://tailscale.com/download/linux)
+
+Join with browser login, or with an auth key (see [Creating Tailscale keys](#creating-tailscale-keys) below).
+
+Before installing OpenMono, you can run a readiness check on each Mac:
+
+```bash
+openmono tunnel prepare              # auto: arm64 → inference, else agent
+openmono tunnel prepare --inference  # force Mini checklist
+openmono tunnel prepare --agent      # force agent checklist
+```
+
+### Step 2 — Inference box: run Tailscale tunnel setup
+
+With llama-server already installed (`openmono setup` role **2 — Inference server only**, or full/single-box):
+
+```bash
+openmono tunnel setup --tailscale
+# optional non-interactive join:
+# openmono tunnel setup --tailscale --auth-key tskey-auth-...
+# or: TS_AUTHKEY=tskey-auth-... openmono tunnel setup --tailscale
+```
+
+The script reuses an existing Tailscale session when possible, ensures `LLAMA_API_KEY` exists, and prints the MagicDNS (preferred) or `100.x` endpoint.
+
+**Manual alternative** (no helper script):
+
+```bash
+tailscale up                    # or: tailscale up --auth-key tskey-auth-...
+tailscale ip -4                 # note the 100.x address
+# MagicDNS name also appears in: tailscale status
+openmono start                  # ensure llama-server is listening on :7474
+grep LLAMA_API_KEY docker/.env  # or: openmono config get llm.api_key
+```
+
+### Step 3 — Agent box: point at the Tailscale endpoint
+
+On the laptop (same tailnet):
+
+```bash
+openmono config set llm.endpoint  http://<magicdns-or-100.x>:7474
+openmono config set llm.api_key   <token-from-inference-box>
+cd your-project/
+openmono agent
+```
+
+### Creating Tailscale keys
+
+Create keys in the admin console: [login.tailscale.com/admin/settings/keys](https://login.tailscale.com/admin/settings/keys)
+
+| Kind | Prefix | Use with OpenMono |
+|------|--------|-------------------|
+| **Auth key** | `tskey-auth-` | Join devices (`tailscale up --auth-key=...` / `openmono tunnel setup --tailscale`). This is what dual-box setup needs. |
+| **API access token** | `tskey-api-` | Call Tailscale’s admin API (e.g. mint auth keys programmatically). **Not** required for day-to-day dual-box. |
+
+Recommended auth-key settings for an always-on inference box:
+
+- **Not ephemeral** (keep the node after reboot/offline)
+- **Pre-approved** if your tailnet has device approval enabled
+- Reusable only if you intentionally want one key for multiple machines
+
+Advanced (optional): mint an auth key from an API access token:
+
+```bash
+curl -s -u "tskey-api-XXXX:" \
+  -H 'Content-Type: application/json' \
+  -d '{"capabilities":{"devices":{"create":{"reusable":false,"ephemeral":false,"preauthorized":true}}},"expirySeconds":86400}' \
+  "https://api.tailscale.com/api/v2/tailnet/-/keys"
+```
+
+Use the returned `key` (`tskey-auth-...`) with `openmono tunnel setup --tailscale --auth-key ...`.
+
+### Tailscale troubleshooting
+
+> [!CAUTION]
+> **Logged out / Failed to load preferences** — open Tailscale.app and complete browser login. `openmono tunnel status` prints the live login URL when the node is in `NeedsLogin`.
+
+> [!CAUTION]
+> **Cannot reach endpoint** — confirm both machines show `Running` in `tailscale status`, use the inference box MagicDNS name or `100.x` IP (not a LAN IP), and check tailnet ACLs allow TCP **7474** between agent and inference tags/users.
+
+> [!CAUTION]
+> **401 Unauthorized** — same as the relay path: `LLAMA_API_KEY` on the inference box must match `llm.api_key` on the agent. See [Troubleshooting (relay and Tailscale)](#troubleshooting-relay-and-tailscale) above.
+
+See also [docs/SECURITY.md](SECURITY.md) for dual-box hardening (API keys, bind host, ACLs).
 
 ---
 

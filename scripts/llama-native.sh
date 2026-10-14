@@ -9,6 +9,45 @@
 # should be sourced by openmono and its functions called via native_cmd_*()
 # ──────────────────────────────────────────────────────────────────────────────
 
+# shellcheck source=lib/env-file.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib/env-file.sh"
+
+# Repo root is the parent of scripts/, unless the caller already set REPO_DIR.
+_native_repo_root() {
+    if [[ -n "${REPO_DIR:-}" ]]; then
+        printf '%s\n' "$REPO_DIR"
+        return 0
+    fi
+    (cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+}
+
+_native_docker_env() {
+    printf '%s\n' "$(_native_repo_root)/docker/.env"
+}
+
+# Port from the environment, then settings, then the OpenMono default.
+# Stop uses this so a missing settings file cannot leave llama-server running.
+_native_port() {
+    if [[ -n "${LLAMA_NATIVE_PORT:-}" ]]; then
+        printf '%s\n' "$LLAMA_NATIVE_PORT"
+        return 0
+    fi
+    if [[ -n "${LLAMA_PORT:-}" ]]; then
+        printf '%s\n' "$LLAMA_PORT"
+        return 0
+    fi
+    local settings="${OPENMONO_SETTINGS:-$HOME/.openmono/settings.json}"
+    local port=""
+    if [[ -f "$settings" ]] && command -v jq >/dev/null 2>&1; then
+        port="$(jq -r '.inference.port // empty' "$settings" 2>/dev/null || true)"
+    fi
+    if [[ -n "$port" && "$port" != "null" ]]; then
+        printf '%s\n' "$port"
+        return 0
+    fi
+    printf '%s\n' 7474
+}
+
 # Load settings.json and set native-specific variables
 _native_load_config() {
     local settings="$HOME/.openmono/settings.json"
@@ -47,28 +86,78 @@ _native_start_llama() {
     local cpu_threads
     cpu_threads=$(sysctl -n hw.physicalcpu 2>/dev/null || echo 4)
 
-    # Read API key from docker/.env (single source of truth)
+    # Read API key from docker/.env (single source of truth), then settings.json
     local api_key=""
-    local docker_env="${REPO_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}/docker/.env"
+    local docker_env
+    docker_env="$(_native_docker_env)"
     if [[ -f "$docker_env" ]]; then
         api_key=$(grep '^LLAMA_API_KEY=' "$docker_env" 2>/dev/null | cut -d= -f2- | tr -d '[:space:]' || true)
     fi
+    if [[ -z "$api_key" && -f "$HOME/.openmono/settings.json" ]] && command -v jq &>/dev/null; then
+        api_key=$(jq -r '.inference.api_key // .llm.api_key // empty' "$HOME/.openmono/settings.json" 2>/dev/null || true)
+    fi
+
+    # Dual-box / Tailscale: never start without an API key (docs/SECURITY.md)
+    local require_key="${LLAMA_REQUIRE_API_KEY:-}"
+    if [[ -z "$require_key" && -f "$HOME/.openmono/tailscale-tunnel.json" ]]; then
+        require_key=1
+    fi
+    if [[ "$require_key" == "1" && -z "$api_key" ]]; then
+        err "LLAMA_API_KEY required for dual-box/Tailscale (refusing insecure start)."
+        err "Run: openmono tunnel setup --tailscale   # generates and stores a key"
+        err "Or set LLAMA_REQUIRE_API_KEY=0 to override (not recommended)."
+        return 1
+    fi
+
+    # Bind host: LLAMA_HOST, else Tailscale IPv4 when Running, else 0.0.0.0
+    local bind_host="${LLAMA_HOST:-}"
+    if [[ -z "$bind_host" ]]; then
+        # shellcheck source=lib/tailscale-cli.sh
+        if [[ -f "$(dirname "${BASH_SOURCE[0]}")/lib/tailscale-cli.sh" ]]; then
+            # shellcheck disable=SC1091
+            source "$(dirname "${BASH_SOURCE[0]}")/lib/tailscale-cli.sh"
+            if resolve_tailscale_cli && tailscale_is_running; then
+                bind_host="$(tailscale_cmd ip -4 2>/dev/null | head -1 || true)"
+            fi
+        fi
+    fi
+    bind_host="${bind_host:-0.0.0.0}"
+    if [[ "$bind_host" != "0.0.0.0" && "$bind_host" != "127.0.0.1" ]]; then
+        info "Binding llama-server to $bind_host (not all interfaces — see docs/SECURITY.md)"
+    fi
 
     info "Starting llama-server (Metal) — model: $MODEL_NAME"
-    nohup llama-server \
-        --model "$model_file" --alias "${MODEL_ALIAS:-${MODEL_NAME%.gguf}}" \
-        --host 0.0.0.0 --port "${LLAMA_NATIVE_PORT:-7474}" \
-        --n-gpu-layers 99 \
-        --ctx-size "$LLAMA_CTX_SIZE" \
-        --threads "$cpu_threads" --batch-size 2048 --ubatch-size 512 \
-        --flash-attn on \
-        --cache-type-k q8_0 --cache-type-v q8_0 \
-        --parallel 1 --jinja --reasoning off --metrics \
-        ${api_key:+--api-key "${api_key}"} \
-        ${LLAMA_MMPROJ_PATH:+--mmproj "${LLAMA_MMPROJ_PATH}" --image-min-tokens 1024 --image-max-tokens 1280} \
-        > "$log_file" 2>&1 &
+    # One argv array so bash 3.2 + set -u does not expand an empty array.
+    local -a server_args=(
+        --model "$model_file" --alias "${MODEL_ALIAS:-${MODEL_NAME%.gguf}}"
+        --host "$bind_host" --port "${LLAMA_NATIVE_PORT:-7474}"
+        --n-gpu-layers 99
+        --ctx-size "$LLAMA_CTX_SIZE"
+        --threads "$cpu_threads" --batch-size 2048 --ubatch-size 512
+        --flash-attn on
+        --cache-type-k q8_0 --cache-type-v q8_0
+        --parallel 1 --jinja --reasoning off --metrics
+    )
+    if [[ -n "$api_key" ]]; then
+        local key_file="$HOME/.openmono/llama-api-key"
+        local old_umask
+        old_umask="$(umask)"
+        umask 077
+        printf '%s\n' "$api_key" > "$key_file"
+        umask "$old_umask"
+        chmod 0600 "$key_file"
+        if llama-server --help 2>&1 | grep -q -- '--api-key-file'; then
+            server_args+=(--api-key-file "$key_file")
+        else
+            server_args+=(--api-key "$api_key")
+        fi
+    fi
+    if [[ -n "${LLAMA_MMPROJ_PATH:-}" ]]; then
+        server_args+=(--mmproj "$LLAMA_MMPROJ_PATH" --image-min-tokens 1024 --image-max-tokens 1280)
+    fi
+    nohup llama-server "${server_args[@]}" > "$log_file" 2>&1 &
     local pid=$!
-    disown $pid
+    disown "$pid" 2>/dev/null || true
 
     # Sanity check: ensure process didn't die immediately
     sleep 0.5
@@ -80,42 +169,109 @@ _native_start_llama() {
     fi
 }
 
-# Stop native llama-server by port with safety check (verify it's really llama-server).
-# Args: $1 = port (optional, defaults to LLAMA_PORT)
+# Resolve a health URL that works for localhost or Tailscale-bound hosts.
+_native_health_url() {
+    local port="${1:-${LLAMA_NATIVE_PORT:-7474}}"
+    local host="${LLAMA_HOST:-}"
+    if [[ -z "$host" || "$host" == "0.0.0.0" ]]; then
+        printf 'http://127.0.0.1:%s/health' "$port"
+    else
+        printf 'http://%s:%s/health' "$host" "$port"
+    fi
+}
+
+# PID of the llama-server bound to this port, including one still loading the model.
+_native_llama_pid() {
+    local port="$1" pid comm
+    pid="$(pgrep -f "llama-server.*--port[= ]${port}([^0-9]|$)" 2>/dev/null | head -n 1 || true)"
+    if [[ -n "$pid" ]]; then
+        printf '%s\n' "$pid"
+        return 0
+    fi
+    pid="$(lsof -ti ":${port}" 2>/dev/null | head -n 1 || true)"
+    if [[ -n "$pid" ]]; then
+        comm="$(ps -p "$pid" -o comm= 2>/dev/null || true)"
+        if [[ "$comm" == *llama-server* ]]; then
+            printf '%s\n' "$pid"
+            return 0
+        fi
+    fi
+    return 1
+}
+
+# Stop native llama-server by port. Health is not required: a model can take
+# minutes to load, and stop must still reach that process.
+# Args: $1 = port (optional, defaults to LLAMA_NATIVE_PORT)
 _native_stop_llama() {
     local port="${1:-${LLAMA_NATIVE_PORT:-7474}}"
-
-    # Check if llama-server is actually responding on the port (best indicator that it's really running)
-    if ! curl -sf "http://localhost:${port}/health" &>/dev/null; then
-        warn "llama-server is not responding on port ${port}"
-        return 1
-    fi
-
-    # Find llama-server process by name (more reliable than port-based lookup)
     local pid
-    pid=$(pgrep -f "llama-server.*--port.*${port}" 2>/dev/null | head -1 || true)
+    pid="$(_native_llama_pid "$port" || true)"
 
     if [[ -z "$pid" ]]; then
-        warn "llama-server process not found (port ${port} may be in use by something else)"
+        warn "llama-server is not running on port ${port}"
         return 1
     fi
 
     info "Stopping llama-server (PID $pid) on port ${port}..."
     kill "$pid" 2>/dev/null || true
-    sleep 1
-    ok "Stopped"
+    local i
+    for i in 1 2 3 4 5 6 7 8 9 10; do
+        kill -0 "$pid" 2>/dev/null || return 0
+        sleep 0.3
+    done
+    warn "llama-server did not exit after SIGTERM; sending SIGKILL"
+    kill -9 "$pid" 2>/dev/null || true
+    sleep 0.2
+    if kill -0 "$pid" 2>/dev/null; then
+        err "failed to stop llama-server (PID $pid)"
+        return 1
+    fi
+}
+
+_native_wait_until_healthy() {
+    local port="$1"
+    local tries="${2:-36}"
+    local i
+    for i in $(seq 1 "$tries"); do
+        if _native_health_ok "$port"; then
+            return 0
+        fi
+        sleep 5
+        printf '.'
+    done
+    printf '\n'
+    return 1
 }
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Native command implementations (called from openmono)
 # ──────────────────────────────────────────────────────────────────────────────
 
+# True if llama-server answers on any expected bind address.
+_native_health_ok() {
+    local port="${1:-${LLAMA_NATIVE_PORT:-7474}}"
+    local health host
+    health="$(_native_health_url "$port")"
+    curl -sf --max-time 2 "$health" &>/dev/null && return 0
+    curl -sf --max-time 2 "http://127.0.0.1:${port}/health" &>/dev/null && return 0
+    curl -sf --max-time 2 "http://localhost:${port}/health" &>/dev/null && return 0
+    # shellcheck disable=SC1091
+    if [[ -f "$(dirname "${BASH_SOURCE[0]}")/lib/tailscale-cli.sh" ]]; then
+        source "$(dirname "${BASH_SOURCE[0]}")/lib/tailscale-cli.sh"
+        if resolve_tailscale_cli && tailscale_is_running; then
+            host="$(tailscale_cmd ip -4 2>/dev/null | head -1 || true)"
+            [[ -n "$host" ]] && curl -sf --max-time 2 "http://${host}:${port}/health" &>/dev/null && return 0
+        fi
+    fi
+    return 1
+}
+
 native_cmd_start() {
     _native_load_config || return 1
     local port="${LLAMA_NATIVE_PORT:-7474}"
 
     # Check if llama-server is already healthy (best indicator)
-    if curl -sf "http://localhost:${port}/health" &>/dev/null; then
+    if _native_health_ok "$port"; then
         ok "llama-server already running on port ${port}"
         return 0
     fi
@@ -123,22 +279,19 @@ native_cmd_start() {
     _native_start_llama || return 1
 
     info "Waiting for llama-server to be healthy (model load: 1-3 min)..."
-    for i in $(seq 1 36); do
-        if curl -sf "http://localhost:${port}/health" &>/dev/null; then
-            ok "llama-server is healthy on port ${port} (Metal GPU)"
-            return 0
-        fi
-        sleep 5
-        printf "."
-    done
-    echo ""
+    if _native_wait_until_healthy "$port" 36; then
+        ok "llama-server is healthy on port ${port} (Metal GPU)"
+        return 0
+    fi
     warn "llama-server did not become healthy within 180s — check: tail -f $HOME/.openmono/logs/llama-server.log"
     return 1
 }
 
 native_cmd_stop() {
-    _native_load_config || return 1
-    _native_stop_llama "${LLAMA_NATIVE_PORT:-7474}" || return 1
+    _native_load_config || true
+    local port
+    port="$(_native_port)"
+    _native_stop_llama "$port" || return 1
     ok "llama-server stopped"
 }
 
@@ -149,15 +302,10 @@ native_cmd_restart() {
     sleep 1
     _native_start_llama || return 1
     info "Waiting for llama-server to be healthy..."
-    for i in $(seq 1 36); do
-        if curl -sf "http://localhost:${port}/health" &>/dev/null; then
-            ok "llama-server restarted and healthy on port ${port} (Metal GPU)"
-            return 0
-        fi
-        sleep 5
-        printf "."
-    done
-    echo ""
+    if _native_wait_until_healthy "$port" 36; then
+        ok "llama-server restarted and healthy on port ${port} (Metal GPU)"
+        return 0
+    fi
     warn "llama-server did not become healthy within 180s"
     return 1
 }
@@ -204,11 +352,12 @@ native_cmd_status() {
         printf "│ Vision          : disabled\n"
     fi
 
-    # Health check
-    if curl -sf "http://localhost:${port}/health" &>/dev/null; then
-        printf "│ Health Endpoint : ${GREEN}✓${NC} http://localhost:${port}/health\n"
+    local health_url
+    health_url="$(_native_health_url "$port")"
+    if _native_health_ok "$port"; then
+        printf "│ Health Endpoint : ${GREEN}✓${NC} %s\n" "$health_url"
     else
-        printf "│ Health Endpoint : ${YELLOW}✗${NC} http://localhost:${port}/health (offline)\n"
+        printf "│ Health Endpoint : ${YELLOW}✗${NC} %s (offline)\n" "$health_url"
     fi
 
     # Apple Silicon info
@@ -225,25 +374,19 @@ native_cmd_agent() {
     _native_load_config || return 1
     local port="${LLAMA_NATIVE_PORT:-7474}"
 
-    # If llama-server is not running, start it
-    if ! curl -sf "http://localhost:${port}/health" &>/dev/null; then
-        info "llama-server not running — starting it (Metal, model load: 1–3 min)..."
-        _native_start_llama || return 1
-        info "Waiting for llama-server to be healthy..."
-        for i in $(seq 1 36); do
-            if curl -sf "http://localhost:${port}/health" &>/dev/null; then
-                ok "llama-server is healthy"
-                break
-            fi
-            sleep 5
-            printf "."
-        done
-        echo ""
+    if _native_health_ok "$port"; then
+        return 0
     fi
-
-    # Note: agent startup happens in cmd_agent() after calling this function.
-    # This function only ensures llama-server is running; Docker agent startup is
-    # handled back in cmd_agent() with full docker compose setup.
+    info "llama-server not running — starting it (Metal, model load: 1–3 min)..."
+    _native_start_llama || return 1
+    info "Waiting for llama-server to be healthy..."
+    if _native_wait_until_healthy "$port" 36; then
+        ok "llama-server is healthy"
+        return 0
+    fi
+    # cmd_agent() starts the Docker agent only after this returns success.
+    err "llama-server did not become healthy — agent not started"
+    return 1
 }
 
 native_cmd_tunnel_rotate_key() {
@@ -254,41 +397,42 @@ native_cmd_tunnel_rotate_key() {
     local new_key
     new_key="$(openssl rand -hex 24)"
 
-    # Update docker/.env with new API key (single source of truth)
-    local docker_env="${REPO_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}/docker/.env"
-    if [[ ! -f "$docker_env" ]]; then
-        mkdir -p "$(dirname "$docker_env")"
-        touch "$docker_env"
-    fi
-    grep -v '^LLAMA_API_KEY=' "$docker_env" > /tmp/env.tmp 2>/dev/null || true
-    echo "LLAMA_API_KEY=$new_key" >> /tmp/env.tmp
-    mv /tmp/env.tmp "$docker_env"
-    chmod 0600 "$docker_env"
+    local docker_env
+    docker_env="$(_native_docker_env)"
+    upsert_env_key "$docker_env" LLAMA_API_KEY "$new_key"
     ok "LLAMA_API_KEY rotated in docker/.env"
 
-    # Stop and restart llama-server with new key
-    local pid proc_name
-    pid=$(lsof -ti ":${port}" 2>/dev/null | head -1 || true)
+    # Restart only a real llama-server, including one still loading the model.
+    local pid other
+    pid="$(_native_llama_pid "$port" || true)"
     if [[ -n "$pid" ]]; then
-        proc_name=$(ps -p "$pid" -o comm= 2>/dev/null || true)
-        if [[ "$proc_name" == *"llama-server"* ]]; then
-            _native_stop_llama "$port" || true
-            sleep 1
-            info "Restarting native llama-server with new API key..."
-            _native_start_llama || warn "Restart failed — run manually: openmono start"
+        _native_stop_llama "$port" || true
+        sleep 1
+        info "Restarting native llama-server with new API key..."
+        if _native_start_llama; then
             ok "llama-server restarted (Metal)"
         else
-            warn "Port ${port} is in use by '${proc_name}' (PID $pid) — not llama-server"
-            warn "Manually restart llama-server after verifying port is free: openmono restart"
+            warn "Restart failed — run manually: openmono start"
+            return 1
         fi
     else
-        warn "llama-server is not running — start it with: openmono start"
+        other="$(lsof -ti ":${port}" 2>/dev/null | head -n 1 || true)"
+        if [[ -n "$other" ]]; then
+            warn "Port ${port} is in use by PID $other — not llama-server"
+            warn "Manually restart llama-server after verifying port is free: openmono restart"
+        else
+            warn "llama-server is not running — start it with: openmono start"
+        fi
     fi
 
-    # Print config commands for agent box (same as Docker path)
-    local relay_cache="$HOME/.openmono/relay.json"
+    # Print config commands for agent box (Tailscale preferred over relay)
     local endpoint=""
-    if [[ -f "$relay_cache" ]]; then
+    local ts_cache="$HOME/.openmono/tailscale-tunnel.json"
+    local relay_cache="$HOME/.openmono/relay.json"
+    if [[ -f "$ts_cache" ]]; then
+        endpoint="$(jq -r '.endpoint // empty' "$ts_cache" 2>/dev/null || true)"
+    fi
+    if [[ -z "$endpoint" && -f "$relay_cache" ]]; then
         local frps_addr remote_port
         frps_addr="$(jq -r '.frpsAddress // empty' "$relay_cache" 2>/dev/null)"
         remote_port="$(jq -r '.remotePort // empty' "$relay_cache" 2>/dev/null)"
